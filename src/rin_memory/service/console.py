@@ -111,12 +111,13 @@ def _section_view(raw: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _fact_view(raw: Mapping[str, Any]) -> dict[str, Any]:
+    confidence = _float(raw.get("confidence"), float("nan"))
     return {
         "id": str(raw.get("id") or ""),
         "text": str(raw.get("text") or ""),
         "importance": _int(raw.get("importance"), 5),
         "absorbed": bool(raw.get("absorbed")),
-        "confidence": _float(raw.get("confidence"), 0.8),
+        "confidence": confidence if 0 <= confidence <= 1 else None,
         "source_keys": [
             str(item) for item in raw.get("source_event_keys") or ()
             if isinstance(item, str)

@@ -878,14 +878,14 @@
         return '<tr data-status="' + status + '"><td class="content">' + esc(fact.text)
           + '</td><td><span class="st ' + (fact.absorbed ? "ok" : "wait") + '">' + status
           + '</span></td><td class="dim">' + sourceLabel(fact.source_keys) + " · " + dayLabel(fact.created_at)
-          + '</td><td class="num">' + Number(fact.confidence || 0).toFixed(2)
+          + '</td><td class="num">' + (typeof fact.confidence === "number" ? fact.confidence.toFixed(2) : "未评分")
           + '</td><td class="mono">' + esc(fact.id) + "</td></tr>";
       }).join("");
     }
     const tools = $('[data-page="facts"] .page-tools');
     if (tools) tools.innerHTML = '<a class="btn" href="/api/export" download="rin-memory.json">导出 JSON</a>';
     const footer = $('[data-page="facts"] .card-f');
-    if (footer) footer.innerHTML = '<span class="dim">置信度来自引擎抽取 · 事实只读</span><a href="/api/export" download="rin-memory.json">导出 JSON →</a>';
+    if (footer) footer.innerHTML = '<span class="dim">未提供置信度的事实显示「未评分」· 人格演化依据独立经历与有效证据</span><a href="/api/export" download="rin-memory.json">导出 JSON →</a>';
   }
 
   /* ---------- reflections ---------- */
@@ -921,6 +921,7 @@
     }
     if (reflections.length) selectLiveReflection(reflections[0].id);
     else if (growth.length) selectLiveReflection(growth[0].id);
+    else selectLiveReflection(null);
   }
 
   function selectLiveReflection(reflectionId) {
@@ -928,7 +929,6 @@
     const growth = LIVE.snapshot.reflections.growth || [];
     const row = reflections.find((item) => item.id === reflectionId);
     const grow = growth.find((item) => item.id === reflectionId);
-    if (!row && !grow) return;
     $$('[data-page="reflections"] .refl-row').forEach((node) => {
       node.classList.toggle("selected", node.dataset.liveRefl === reflectionId || node.dataset.liveGrowth === reflectionId);
     });
@@ -939,6 +939,16 @@
     const suggest = $("#reflSuggest");
     const foot = $("#reflFoot");
     const actions = $('[data-page="reflections"] .detail-act');
+    if (!row && !grow) {
+      if (hint) hint.textContent = "暂无反思";
+      if (title) title.textContent = "暂无反思详情";
+      if (reason) reason.textContent = "生成反思或成长后，在左侧选择查看。";
+      if (ev) ev.innerHTML = '<tr><td colspan="3" class="dim">暂无证据</td></tr>';
+      if (suggest) suggest.textContent = "有新的真实经历时，引擎会按维护计划整理。";
+      if (foot) foot.textContent = "尚无可查看的条目";
+      if (actions) actions.innerHTML = "";
+      return;
+    }
     if (grow) {
       if (hint) hint.textContent = grow.id + " · 成长";
       if (title) title.textContent = grow.text;
@@ -1176,15 +1186,28 @@
     const note = $("#evoNote");
     if (note) note.textContent = evolution.mode === "auto" ? "自动模式只处理可演化段，冻结段不受影响" : "自动模式需要人工开启";
     if (proposals.length) selectLiveProposal(proposals[0].proposal_id);
+    else selectLiveProposal(null);
   }
 
   function selectLiveProposal(proposalId) {
     const proposal = (LIVE.proposals || []).find((row) => row.proposal_id === proposalId);
-    if (!proposal) return;
-    LIVE.selectedProposal = proposal;
+    LIVE.selectedProposal = proposal || null;
     $$('[data-page="evolution"] .prop-row').forEach((node) => {
       node.classList.toggle("selected", node.dataset.liveProposal === proposalId);
     });
+    if (!proposal) {
+      const empty = { "#propHint": "暂无提案", "#propTitle": "暂无提案详情",
+        "#propBefore": "—", "#propAfter": "—", "#propEv": "暂无证据", "#propImpact": "暂无修改" };
+      Object.entries(empty).forEach(([selector, text]) => {
+        const node = $(selector);
+        if (node) node.textContent = text;
+      });
+      const noop = $("#propNoop");
+      if (noop) noop.hidden = true;
+      const actions = $('[data-page="evolution"] .detail-act');
+      if (actions) actions.innerHTML = "";
+      return;
+    }
     const diff = proposalDiff(proposal);
     const hint = $("#propHint");
     if (hint) hint.textContent = proposal.proposal_id + " · " + ({ proposed: "待审核", accepted: "已采纳", rejected: "已驳回", withdrawn: "已撤回" }[proposal.status] || proposal.status);

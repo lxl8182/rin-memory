@@ -8,6 +8,7 @@ from pathlib import Path
 
 from rin_memory.service.management import ManagementApi
 from rin_memory.service.memory_service import MemoryService, ServiceSettings
+from rin_memory.service.console import _fact_view
 if __package__:
     from .test_b12_evolution import FakeModel, INITIAL, PROPOSAL
 else:
@@ -15,6 +16,13 @@ else:
 
 
 class EvolutionDisplayTests(unittest.TestCase):
+    def test_fact_confidence_requires_an_explicit_valid_score(self):
+        for score in (None, "invalid", True, -0.1, 1.1, float("nan"), float("inf")):
+            self.assertIsNone(_fact_view({"confidence": score})["confidence"])
+        self.assertIsNone(_fact_view({})["confidence"])
+        self.assertEqual(_fact_view({"confidence": 0})["confidence"], 0)
+        self.assertEqual(_fact_view({"confidence": 0.86})["confidence"], 0.86)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
@@ -108,16 +116,18 @@ class EvolutionDisplayTests(unittest.TestCase):
 const assert = require("node:assert/strict");
 const vm = require("node:vm");
 const fs = require("node:fs");
-const nodes = new Map([["#propNoop", {hidden: false}]]);
+const nodes = new Map(["#propNoop", "#propHint", "#propTitle", "#propBefore", "#propAfter", "#propEv", "#propImpact",
+  "#reflHint", "#reflTitle", "#reflReason", "#reflEv", "#reflSuggest", "#reflFoot",
+  '[data-page="reflections"] .detail-act', '[data-page="evolution"] .detail-act'].map(key => [key, {hidden: false}]));
 const window = {__RIN_SERVICE__: true};
 const context = {window, document: {querySelector: key => nodes.get(key) || null,
   querySelectorAll: () => [], addEventListener: () => {}},
   location: {origin: "http://test"}, sessionStorage: {getItem: () => null},
   fetch: () => new Promise(() => {}), setInterval: () => 0};
 const source = fs.readFileSync(process.argv[1], "utf8").replace(/\}\)\(\);\s*$/,
-  "window.testViews = {proposalDiff, publicationState, selectLiveProposal};})();");
+  "window.testViews = {proposalDiff, publicationState, selectLiveProposal, renderReflections, renderEvolution};})();");
 vm.runInNewContext(source, context);
-const {proposalDiff, publicationState, selectLiveProposal} = window.testViews;
+const {proposalDiff, publicationState, selectLiveProposal, renderReflections, renderEvolution} = window.testViews;
 const accepted = {proposal_id: "accepted", base_revision: 6, status: "accepted", operations: [],
   changes: [{section_id: "tone", before_available: true, before: "原文", after: "新文", noop: false}]};
 window.RIN_LIVE.snapshot = {persona: {card: {sections: [{section_id: "tone", text: "新文"}]}}, facts: {facts: []}, reflections: {reflections: []}};
@@ -144,6 +154,23 @@ assert.equal(publicationState(persona).names.length, 1);
 assert.match(publicationState({...persona, stale: true}).notice, /尚未发布/);
 assert.match(publicationState({...persona, consumers: {...persona.consumers, chat: {status: "pending", version: "v6"}}}).notice, /等待采用/);
 assert.match(publicationState({...persona, consumers: {...persona.consumers, chat: {status: "failed", version: "v7"}}}).notice, /采用失败/);
+window.RIN_LIVE.snapshot.reflections.reflections = [{id: "real", text: "真实反思", evidence: []}];
+renderReflections();
+assert.equal(nodes.get("#reflTitle").textContent, "真实反思");
+assert.match(nodes.get('[data-page="reflections"] .detail-act').innerHTML, /查看演化/);
+window.RIN_LIVE.snapshot.reflections.reflections = [];
+renderReflections();
+assert.equal(nodes.get("#reflTitle").textContent, "暂无反思详情");
+assert.equal(nodes.get('[data-page="reflections"] .detail-act').innerHTML, "");
+window.RIN_LIVE.snapshot.evolution = {mode: "auto", proposals: [accepted]};
+renderEvolution();
+assert.equal(window.RIN_LIVE.selectedProposal.proposal_id, "accepted");
+window.RIN_LIVE.snapshot.evolution.proposals = [];
+renderEvolution();
+assert.equal(window.RIN_LIVE.selectedProposal, null);
+assert.equal(nodes.get("#propTitle").textContent, "暂无提案详情");
+assert.equal(nodes.get("#propBefore").textContent, "—");
+assert.equal(nodes.get('[data-page="evolution"] .detail-act').innerHTML, "");
 '''
         source = Path(__file__).resolve().parents[1] / "webui/designs/tidebell/live.js"
         subprocess.run([shutil.which("node"), "-e", script, str(source)], check=True, capture_output=True, text=True)
