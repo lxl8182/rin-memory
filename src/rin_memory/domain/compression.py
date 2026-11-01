@@ -20,6 +20,7 @@ from typing import Any, Mapping
 from ..domain.barrier import DeletionBarrier, message_text
 from ..ports import Clock, ModelInvoker
 from ..persistence.recent import RecentStore, is_summary_message
+from .prompt_voice import FIRST_PERSON_VOICE
 
 #: Host defaults (config/memory_settings.py): 20 items trigger, keep last 10.
 DEFAULT_THRESHOLD_ITEMS = 20
@@ -155,9 +156,11 @@ class CompressionService:
             lines.append(f"{role} | {text}")
         body = "\n".join(lines)
         return (
-            "请把下面的对话压缩成一段不超过 1000 token 的中文备忘录，"
-            "保留用户稳定的事实、偏好、约定和未完成的计划；不要添加对话里没有的信息。\n"
-            "只输出备忘录正文，不要标题或解释。\n\n"
+            FIRST_PERSON_VOICE
+            + "我把下面的对话整理成一段 1000 token 以内的中文回忆便条，"
+            "保留对方的稳定事实、偏好、我们的约定和待完成的计划，"
+            "以及这段交流里的重要回应与进展。内容依据实际对话，延续我的第一人称视角。\n"
+            "本次输出为备忘录正文。\n\n"
             f"对话：\n{body}"
         )
 

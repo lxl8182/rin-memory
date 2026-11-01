@@ -146,6 +146,11 @@ def evidence_flags_of(fact: Mapping[str, Any]) -> tuple[str, ...]:
     flags = list(EVIDENCE_KIND_FLAGS.get(kind, ()))
     source = _text(fact.get("source"), 40)
     for flag in EVIDENCE_FLAGS_BY_SOURCE.get(source, ()):
+        bindings = fact.get("source_bindings") or ()
+        if flag == "both_party" and bindings:
+            roles = {row.get("role") for row in bindings}
+            if not {"user", "assistant"} <= roles and kind not in ("observed_action", "tool_result"):
+                continue
         if flag not in flags:
             flags.append(flag)
     return tuple(flag for flag in EVIDENCE_FLAGS if flag in flags)
@@ -195,6 +200,13 @@ def experiences_of(fact: Mapping[str, Any]) -> list[tuple[str, list[str]]]:
 
 
 def _support_entry(fact: Mapping[str, Any], key: str) -> dict[str, Any]:
+    bindings = [item for item in fact.get("source_bindings") or ()
+                if isinstance(item, Mapping) and item.get("source_key") == key]
+    if bindings:
+        kinds = {item.get("evidence_kind") for item in bindings}
+        kind = next((value for value in ("tool_result", "observed_action", "explicit_feedback", "user_assertion",
+                                         "agent_expression", "quoted_example") if value in kinds), "user_assertion")
+        fact = dict(fact, evidence_kind=kind)
     return {
         "key": key,
         "fact_id": _fact_id(fact),
@@ -218,9 +230,13 @@ def support_basis_from_facts(
     basis: list[dict[str, Any]] = []
     by_experience: dict[str, dict[str, Any]] = {}
     for fact in facts:
-        if not isinstance(fact, Mapping) or not counts_as_experience(fact):
+        if not isinstance(fact, Mapping):
             continue
         for experience, keys in experiences_of(fact):
+            new_entries = [_support_entry(fact, key) for key in keys or ("",)]
+            new_entries = [item for item in new_entries if item["kind"] in EVIDENCE_KIND_COUNTS]
+            if not new_entries:
+                continue
             entry = by_experience.get(experience)
             if entry is None:
                 if len(basis) >= MAX_SUPPORT_EXPERIENCES:
@@ -231,10 +247,6 @@ def support_basis_from_facts(
             fact_id = _fact_id(fact)
             if fact_id and fact_id not in entry["facts"]:
                 entry["facts"].append(fact_id)
-            new_entries = (
-                [_support_entry(fact, key) for key in keys] if keys
-                else [_support_entry(fact, "")]
-            )
             for item in new_entries:
                 signature = (item["key"], item["fact_id"])
                 if any(

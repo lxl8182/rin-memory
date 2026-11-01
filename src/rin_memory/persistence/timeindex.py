@@ -341,6 +341,27 @@ class TimeIndexStore:
             ).fetchone()
             return None if row is None else dict(row)
 
+    def original_for_sources(self, source_keys: Sequence[str], *, limit: int = 40) -> list[dict[str, Any]]:
+        """Read source-linked exchanges in business order without an FTS guess."""
+        keys = sorted(set(source_keys))
+        if not keys:
+            return []
+        placeholders = ",".join("?" for _ in keys)
+        with self._lock:
+            connection = self._require_open()
+            rows = connection.execute(
+                f"SELECT id, session_id, message, timestamp FROM {ORIGINAL_TABLE} "
+                "WHERE EXISTS (SELECT 1 FROM json_tree("
+                "CASE WHEN json_valid(message) THEN message ELSE '{}' END) "
+                f"WHERE type='text' AND value IN ({placeholders})) "
+                "ORDER BY timestamp, id LIMIT ?",
+                (*keys, int(limit)),
+            ).fetchall()
+            # Only metadata bindings establish identity; a key quoted in text
+            # is a SQL prefilter hit, not an exchange citation.
+            return [dict(row) for row in rows
+                    if message_source_keys(json.loads(row["message"])) & set(keys)]
+
     def search(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
         """Rank `facts_fts_v2` rows against an FTS5 query, best match first.
 

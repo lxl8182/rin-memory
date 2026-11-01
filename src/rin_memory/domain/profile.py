@@ -82,16 +82,17 @@ STATUS_INVALIDATED = "invalidated"
 #: a signal without a citation is discarded by the service, so the prompt must
 #: ask for one instead of letting the model omit it.
 SIGNAL_PROMPT = (
-    "\n\n另外提取用户表达的兴趣信号。最终输出改为 JSON 对象："
+    "\n\n我同时整理对方表达的兴趣信号。最终输出采用 JSON 对象："
     '{"facts":[上述事实],"interest_signals":[{"topic":"具体主题",'
     '"keywords":["关键词"],"signal":"like|curious|dislike|paused",'
     '"evidence_refs":[原话编号]}]}；有事项时同样保留 state_updates 字段。'
-    "like 只用于用户明确、长期成立的喜欢；curious 是最近想试、刚产生的兴趣；"
-    "dislike 是明确的长期不喜欢；paused 是用户要求别再提这个话题。"
-    "最近想试的东西不等于长期喜好，不要写成 like。"
-    "evidence_refs 必须是能支持该信号的本轮/本批原话编号；引用不到原话的信号会被丢弃，"
-    "前文、助手说过的话、外部素材和对话示例都不算兴趣证据。"
-    "没有兴趣信号时输出空数组。单轮原话编号为 1。"
+    "like 表示对方明确表达的长期喜爱；curious 表示最近想试、刚产生的兴趣；"
+    "dislike 表示明确的长期厌恶；paused 表示对方希望暂停这个话题。"
+    "我依据对方在本轮/本批的直接表达选择信号，"
+    "兴趣信号对应对方本人明确表达的喜好、厌恶和探索意愿；"
+    "我把展示作品、叙述经历或询问我的感受保留在事实与经历中，我自己的好奇和选择记为 neko 的表达。"
+    "evidence_refs 填写实际支持它的原话编号；其他材料帮助我理解话题背景。"
+    "兴趣信号为空时使用空数组。单轮原话编号为 1。"
 )
 
 

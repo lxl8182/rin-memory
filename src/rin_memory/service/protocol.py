@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from ..classification import CONTENT_CLASSES
 from ..contracts import Scene, Scope
 from ..domain.persona_teaching import EXPRESSION_SECTION_ID
+from ..domain.memory_awareness import memory_awareness
 from ..event_sources import parse_source_key, sanitize_component
 from ..invalidation import row_matches_subject, scene_applies
 from ..persistence.records import event_from_snapshot, fingerprint
@@ -144,6 +145,15 @@ class ServiceProtocol:
         correction = self.core.correction_service.block(
             self.character, subject=scope["subject"], scene=scene_object(scope["scene"]),
         )
+        client_id = scope.get("client_id", "")
+        client = self.service.settings.clients.get(client_id) or {}
+        web = client_id in ("", "console")
+        awareness = memory_awareness(
+            correction=web or client.get("memory_tools", False),
+            teaching=client.get("persona_teach", False), web=web,
+            reflection=self.core.maintenance.settings.enable_reflection and self.core.reflection_service._model is not None,
+            mode=self.core.persona_admin_service.get_mode(self.character),
+        )
         # Required constraints are read independently of the optional recall budget.
         receipt_id = "ctx_" + uuid.uuid4().hex
         result = {
@@ -151,6 +161,7 @@ class ServiceProtocol:
             "card_revision": published.revision if published.available else card.revision,
             "projection": projection, "persona": "\n\n".join(projection.values()),
             "expression": self.expression(projection, card, published),
+            "memory_awareness": awareness,
             "context": recall, "corrections": {"block": correction.block, "version": correction.version},
             "recent_turns": self.recent(scope), "context_receipt_id": receipt_id,
             "expires_in_s": 300,

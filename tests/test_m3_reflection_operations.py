@@ -140,7 +140,8 @@ class ReflectionOperationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(core.reflections.load("demo"), [])
         self.assertEqual(core.reflection_service.visible("demo"), [])
         # A no-op batch is a success: it must not consume the failure budget.
-        backoff = core.reflections.load_backoff("demo")
+        backoff = {key: value for key, value in core.reflections.load_backoff("demo").items()
+                   if key.startswith("fg02:")}
         self.assertEqual(len(backoff), 1)
         self.assertEqual(next(iter(backoff.values()))["n"], 0)
 

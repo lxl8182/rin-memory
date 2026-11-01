@@ -726,6 +726,12 @@ class DeletionService:
             if kept == keys:
                 return False
             row["source_event_keys"] = kept
+            if "source_bindings" in row:
+                row["source_bindings"] = [binding for binding in row["source_bindings"]
+                                          if binding.get("source_key") not in source_keys]
+                row["message_refs"] = [binding["message_ref"] for binding in row["source_bindings"]]
+            if "reflection_source_keys" in row:
+                row["reflection_source_keys"] = [key for key in row["reflection_source_keys"] if key not in source_keys]
             return True
 
         hard_ids = {str(value) for value in resolved.get("explicit_fact_ids") or ()}

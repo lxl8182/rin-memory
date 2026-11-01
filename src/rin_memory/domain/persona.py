@@ -42,6 +42,7 @@ from ..invalidation import (
     text_hash,
 )
 from .barrier import DeletionBarrier, episode_ids_of
+from .prompt_voice import FIRST_PERSON_VOICE
 
 if TYPE_CHECKING:  # pragma: no cover - the stores land in the same batch
     from ..persistence.persona import PersonaStore
@@ -1371,11 +1372,12 @@ class PersonaService:
             {
                 "role": "system",
                 "content": (
-                    "你是人格记忆复核器。判断新观察与旧条目是否矛盾，选择动作："
-                    "merge（改旧条目文本）、keep_new（新观察替换旧条目）、"
-                    "keep_old（保留旧条目，新观察仅入历史）、keep_both（并存）。"
-                    '只输出 JSON：{"action": "merge|keep_new|keep_old|keep_both", '
-                    '"text": "合并后文本（merge 时必填）"}'
+                    FIRST_PERSON_VOICE
+                    + "我对照新的观察和原有记忆，整理自己现在的理解，并选择一个动作："
+                    "merge（我重写原条目）、keep_new（我采用新观察替换原条目）、"
+                    "keep_old（我保留原条目，将新观察放入历史）、keep_both（我保留两种有各自情境的认识）。"
+                    '本次输出为 JSON：{"action": "merge|keep_new|keep_old|keep_both", '
+                    '"text": "我用第一人称整合的正文（merge 时填写）"}'
                 ),
             },
             {

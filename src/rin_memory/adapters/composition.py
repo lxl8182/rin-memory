@@ -37,6 +37,8 @@ from ..domain.persona_admin import PersonaAdminService
 from ..domain.persona_card import PersonaCardService
 from ..domain.persona_projection import PersonaProjectionService
 from ..domain.persona_publish import PersonaPublishService
+from ..domain.persona_teaching import PersonaTeachingService
+from ..persistence.persona_teaching import PersonaTeachingStore
 from ..domain.proactive import EVT_PROACTIVE_CANDIDATE, ProactiveService, ProactiveSettings  # noqa: F401 - event type
 from ..domain.recall import RecallService, RecallSettings
 from ..domain.recent import RecentDeletionCleaner
@@ -202,7 +204,12 @@ class _PublishInvalidator:
 
     def invalidate(self, character, fact_ids, **kwargs) -> dict:
         resolved = {"fact_ids": list(fact_ids or ())}
-        return self._publish.invalidate_for_deletion(character, resolved)
+        before = self._publish.current(character)
+        result = self._publish.invalidate_for_deletion(character, resolved)
+        card = self._publish._card_service.get(character)
+        if result.get("current_invalidated") and before.revision == card.revision and any(section.content_basis for section in card.sections):
+            self._publish.publish(character, revision=card.revision, reason="source_corrected")
+        return result
 
 
 class _ProjectionInvalidator:
@@ -402,6 +409,7 @@ class MemoryCore:
     persona_card_service: PersonaCardService
     persona_versions: PersonaVersionStore
     persona_publish: PersonaPublishService
+    persona_teaching: PersonaTeachingService
     persona_projection: PersonaProjectionStore
     persona_projection_service: PersonaProjectionService
     evolution: EvolutionStore
@@ -445,6 +453,8 @@ class MemoryCore:
         """
         self.barrier.refresh(character)
         result = self.sink.recover(character)
+        if not getattr(result, "paused", False):
+            self.persona_teaching.retry_pending(character)
         try:
             self.turn_requests.mark_interrupted_pending(character)
         except Exception:  # noqa: BLE001 - recovery must not fail on bookkeeping
@@ -561,6 +571,8 @@ def build_memory_core(
         roots=roots, store=reflections, facts=facts, barrier=barrier,
         journal=journal, clock=clock, permit=permit, model=model,
         settings=reflection_settings, persona=persona_service,
+        persona_reader=lambda character: persona_publish.current(character),
+        timeindex_factory=timeindex_factory, recent=recent,
     )
     # B10: authoritative persona card (revisions/freeze/projection); the card
     # joins the deletion and correction fan-out alongside the persona entries.
@@ -604,6 +616,11 @@ def build_memory_core(
         evidence_provider=evidence_provider,
         barrier=barrier, journal=journal, clock=clock, permit=permit,
         model=model, settings=evolution_settings,
+    )
+    persona_teaching = PersonaTeachingService(
+        roots=roots, store=PersonaTeachingStore(roots=roots, store=store, clock=clock, permit=permit),
+        card_service=persona_card_service, publish_service=persona_publish, journal=journal,
+        clock=clock, permit=permit, barrier=barrier, model=model, evidence_reader=evidence_provider,
     )
     persona_admin = PersonaAdminStore(
         roots=roots, store=store, clock=clock, permit=permit, barrier=barrier,
@@ -691,7 +708,7 @@ def build_memory_core(
     journal.register_handler(TURN_EVENT_TYPE, turn_requests.apply_replay)
     derived_invalidators = tuple(derived_invalidators) + (
         _ProjectionInvalidator(persona_projection_service),
-        reflection_service, persona_service, persona_card_service,
+        reflection_service, persona_service, persona_card_service, persona_teaching,
         _PublishInvalidator(persona_publish),
         persona_admin_service,
         # S02/R01: a committed reply must stop being served once the fact it
@@ -715,6 +732,7 @@ def build_memory_core(
                 _OutputCleaner(output_service),
                 _ProactiveCleaner(proactive_service),
                 interests,
+                persona_teaching,
             ) if services.persona is None else services.persona,
             recent=RecentDeletionCleaner(recent, barrier),
             # S02/R01: invalidate committed turn results for deleted sources.
@@ -780,6 +798,7 @@ def build_memory_core(
         conversation_state=ConversationState(state_service, barrier, clock),
         proactive=proactive_service,
         interests=interests,
+        persona_reader=lambda character: persona_publish.current(character),
     )
     compression = CompressionService(
         recent=recent, barrier=barrier, clock=clock, model=model,
@@ -811,6 +830,12 @@ def build_memory_core(
         "extract_facts",
         lambda character: extraction.process_outbox(character),
     )
+    def recover_with_teachings(character):
+        result = sink.recover(character)
+        if not getattr(result, "paused", False):
+            persona_teaching.retry_pending(character)
+        return result
+
     maintenance = MaintenanceService(
         dispatcher=outbox_dispatcher,
         deletion_service=deletion_service,
@@ -820,7 +845,7 @@ def build_memory_core(
         outbox=outbox,
         clock=clock,
         settings=maintenance_settings,
-        recover=sink.recover,
+        recover=recover_with_teachings,
         scheduler=evolution_scheduler,
         migrations=tuple(migration_hooks or ()),
         # M5: the audit-cache refresh step. Degrades to skipped when unwired.
@@ -865,6 +890,7 @@ def build_memory_core(
         persona_card_service=persona_card_service,
         persona_versions=persona_versions,
         persona_publish=persona_publish,
+        persona_teaching=persona_teaching,
         persona_projection=persona_projection,
         persona_projection_service=persona_projection_service,
         evolution=evolution,

@@ -51,6 +51,7 @@ from .persona_card import (
     validate_section_id,
 )
 from .reflection import MEMORY_KINDS, PROMOTION_RULES
+from .prompt_voice import FIRST_PERSON_VOICE
 
 EVT_PERSONA_EVOLUTION_PROPOSED = "core.persona_evolution_proposed"
 PURPOSE_PERSONA_EVOLUTION_PROPOSAL = "persona_evolution_proposal"
@@ -74,7 +75,7 @@ REASON_NO_CHANGE = "no_change"
 REASON_PROPOSAL_LIMIT = "proposal_limit"
 REASON_NOT_INITIALIZED = "not_initialized"
 
-_OPERATIONS = frozenset({"add", "replace", "merge", "delete"})
+_OPERATIONS = frozenset({"add", "replace", "delete"})
 _TERMINAL_EVIDENCE_STATUSES = frozenset({
     "deleted", "withdrawn", "corrected", "invalidated", "expired",
 })
@@ -744,18 +745,22 @@ class EvolutionService:
             "max_section_chars": self._settings.max_section_chars,
             "operations": sorted(_OPERATIONS),
             "open_section_ids": [section.section_id for section in selected],
-            "forbidden": "config, credentials, model/voice/path fields",
+            "content_scope": "personality, interests, expression, relationships",
         }
         system = (
-            "You propose local edits to a character persona card. Return ONLY a "
-            "JSON object: {\"operations\":[{\"op\":\"add|replace|merge|delete\","
-            "\"section_id\":\"...\",\"text\":\"...\"}],\"reason\":\"...\"}. "
-            "Use only open_section_ids for replace/merge/delete; add needs a new "
-            "section_id. Never include config, credentials, model, voice or path "
-            "fields. Keep each text within max_section_chars. Evidence marked "
-            "eligible=false is explanation only: it may inform wording but must "
-            "never be the sole justification for an edit. If nothing should "
-            "change, return {\"operations\":[],\"reason\":\"no_change\"}."
+            FIRST_PERSON_VOICE
+            + "我结合当前人格和已经形成的成长，整理此刻完整、连贯的自我描述。"
+            "我把新的理解融入相关段落，用第一人称表达自己的性格、兴趣、判断和相处方式。"
+            "我优先用 replace 重写相关段落，使相近内容自然融合，当前表达准确体现现在的我。"
+            "独立的新方面使用 add，已由其他段落涵盖的重复内容使用 delete。"
+            "我把相近内容合并表达，将过时的理解留在历史中；常规修订优先在现有篇幅内整理，"
+            "新增的独立认识按实际信息需要增加篇幅。\n"
+            "replace/delete 的目标从 open_section_ids 选择，add 使用新的 section_id。"
+            "每段 text 保持在 max_section_chars 范围内。eligible=true 的材料支持本次修订，"
+            "eligible=false 的材料用于理解背景与措辞。reason 用第一人称说明实际变化的缘由。"
+            "当前人格已经准确表达这些认识时，返回 {\"operations\":[],\"reason\":\"no_change\"}。\n"
+            "本次输出为 JSON 对象：{\"operations\":[{\"op\":\"add|replace|delete\","
+            "\"section_id\":\"...\",\"text\":\"...\"}],\"reason\":\"...\"}。"
         )
         user = json.dumps({
             "character": name,
@@ -763,6 +768,9 @@ class EvolutionService:
             "focus_sections": list(req.focus_sections),
             "source_refs": list(req.source_refs),
             "sections": sections_payload,
+            "card_outline": [{"section_id": section.section_id, "kind": section.kind,
+                              "chars": len(section.text), "summary": section.text[:180]}
+                             for section in snapshot.sections],
             "evidence": evidence_payload,
             "constraints": constraints,
         }, ensure_ascii=False)
@@ -844,6 +852,10 @@ class EvolutionService:
             section_id = str(raw.get("section_id") or "").strip()
             text = raw.get("text")
             text = text.strip() if isinstance(text, str) else ""
+            if op_type == "merge":
+                return [], "full_section_required", _validation(
+                    [_check("full_section", False, "full_section_required")], "full_section_required",
+                )
             if op_type not in _OPERATIONS or not section_id:
                 checks.append(_check("operation_shape", False, REASON_VALIDATION_FAILED))
                 return [], REASON_VALIDATION_FAILED, _validation(
@@ -918,6 +930,18 @@ class EvolutionService:
                     normalized_op[key] = copy.deepcopy(raw.get(key))
             if op_type == "add":
                 normalized_op["editable_by"] = dict(normalized_op_editable)
+            elif op_type == "replace" and by_id[section_id].content_basis:
+                basis = copy.deepcopy(dict(by_id[section_id].content_basis))
+                growth = {row["id"]: row for row in basis.get("growth") or ()}
+                for row in rows:
+                    if (row.get("evidence") or {}).get("eligible"):
+                        growth[str(row["id"])] = dict(row)
+                basis["growth"] = list(growth.values())
+                basis["text"] = text
+                basis["paragraphs"] = [{"text": text, "refs": ["user",
+                    *[rule["rule_id"] for rule in basis.get("rules") or ()],
+                    *["growth:" + key for key in growth]]}]
+                normalized_op["content_basis"] = basis
             normalized.append(normalized_op)
 
         checks.append(_check("section_open", True))

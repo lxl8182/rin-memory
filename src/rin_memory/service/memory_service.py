@@ -197,26 +197,14 @@ class MemoryService:
         # startup; an unknown event type would otherwise pause the whole replay.
         # It needs no new core field: the store and the card/publish services it
         # writes through all already exist on the core.
-        self.persona_teaching = self._build_persona_teaching(core)
+        self.persona_teaching = self._build_persona_teaching(core, model)
         from .protocol import ServiceProtocol
         self.protocol = ServiceProtocol(self)
 
     @staticmethod
-    def _build_persona_teaching(core: MemoryCore) -> PersonaTeachingService:
-        store = PersonaTeachingStore(
-            roots=core.roots, store=core.store, clock=core.clock,
-            permit=core.permit,
-        )
-        return PersonaTeachingService(
-            roots=core.roots,
-            store=store,
-            card_service=core.persona_card_service,
-            publish_service=core.persona_publish,
-            journal=core.journal,
-            clock=core.clock,
-            permit=core.permit,
-            barrier=core.barrier,
-        )
+    def _build_persona_teaching(core: MemoryCore, model=None) -> PersonaTeachingService:
+        core.persona_teaching._model = model
+        return core.persona_teaching
 
     # -- lifecycle -------------------------------------------------------
 

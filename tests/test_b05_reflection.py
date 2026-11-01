@@ -127,7 +127,6 @@ class ReflectionFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_synthesis_threshold_idempotent_and_absorbed(self):
         core = self.build()
         core.recover("demo")
-        core.facts.save("demo", facts(4))
         skipped = await core.reflection_service.synthesize("demo")
         self.assertEqual(skipped.status, "skipped")
         self.assertEqual(skipped.reason, "insufficient_facts")

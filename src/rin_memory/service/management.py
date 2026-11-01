@@ -740,17 +740,16 @@ class ManagementApi:
                     "invalid_argument", 400,
                     "quoted_example needs a saved source_key",
                 )
-        with self.console._lock:
-            receipt = self.service.persona_teaching.teach(self.console.character, {
-                "source_key": source["source_key"],
-                "source_text": source["text"],
-                "content_class": content_class,
-                "base_revision": base_revision,
-                "subject": scope["subject"],
-                "client_id": str(identity.get("client_id") or ""),
-                "quoted_example": quoted or None,
-                "target": "next_turn",
-            })
+        receipt = self.service.persona_teaching.teach(self.console.character, {
+            "source_key": source["source_key"],
+            "source_text": source["text"],
+            "content_class": content_class,
+            "base_revision": base_revision,
+            "subject": scope["subject"],
+            "client_id": str(identity.get("client_id") or ""),
+            "quoted_example": quoted or None,
+            "target": "next_turn",
+        })
         return self._teaching_view(receipt, "teach")
 
     def persona_teach_revoke(self, payload: Mapping[str, Any], identity: Mapping) -> dict:
@@ -776,16 +775,15 @@ class ManagementApi:
             parsed = parse_source_key(source_key)
             if parsed is None or parsed.get("character") != self.console.character:
                 raise ApiError("invalid_argument", 400, "source_key is not a saved message reference")
-        with self.console._lock:
-            receipt = self.service.persona_teaching.revoke(
-                self.console.character, {
-                    "teaching_id": teaching_id,
-                    "source_key": source_key,
-                    "base_revision": base_revision,
-                    "subject": scope["subject"],
-                    "reason": str(payload.get("reason") or "user_requested"),
-                },
-            )
+        receipt = self.service.persona_teaching.revoke(
+            self.console.character, {
+                "teaching_id": teaching_id,
+                "source_key": source_key,
+                "base_revision": base_revision,
+                "subject": scope["subject"],
+                "reason": str(payload.get("reason") or "user_requested"),
+            },
+        )
         return self._teaching_view(receipt, "revoke")
 
     @staticmethod

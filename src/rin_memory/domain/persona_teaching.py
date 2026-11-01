@@ -12,19 +12,17 @@ Boundaries this module keeps
   window); the service reads that text itself and derives the rule here. A
   client that could post arbitrary rule text would be a card editor with none of
   the editor's CAS/audit protections.
-* **Rules go into the existing expression section.** The card already has a
-  `tone` section; teaching appends lines to it instead of creating a second
-  expression section (design §5: never let a derived row become a second source
-  of truth). `identity` is never touched and stays frozen.
+* **Rules revise the existing expression section.** The card's `tone` holds
+  the complete integrated prose; paragraphs retain their authored, teaching
+  and adopted-growth sources. `identity` stays under its existing permissions.
 * **The card stays the single render source.** This service writes card text and
   a teaching log; nothing here renders a separate prompt block. Because `tone`
   is already part of the projected persona text, a taught rule reaches the model
   through the same system prompt every other card section does.
-* **Derivation is deterministic.** No model call: the teaching path must work
-  with the conversation tier unavailable and with autonomous evolution off. A
-  small table of explicit-instruction patterns produces one to three rule lines;
-  an instruction that is not a style request is refused with a reason instead of
-  being guessed at.
+* **Intent and composition have separate jobs.** Saved instructions establish
+  rule identity. The configured model integrates prose outside the write lock;
+  simple offline rules use deterministic composition. Publication and recovery
+  use durable prepared/applied/completed phases, independent of evolution mode.
 
 Idempotency: the teaching id is derived from (character, subject, source key),
 so submitting the same saved message twice returns `duplicate` and never
@@ -34,6 +32,7 @@ creates a second revision or a second rule line.
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import re
 import threading
 from dataclasses import dataclass
@@ -44,12 +43,16 @@ from ..persistence.persona_teaching import (
     STATUS_ACTIVE,
     STATUS_REVOKED,
     STATUS_SUPERSEDED,
+    STATUS_PENDING,
     TEACHING_EVENT_TYPE,
     PersonaTeachingStore,
 )
 from ..ports import Clock, StorageRoots, WritePermit
 from .persona_card import MAX_SECTION_TEXT, CardSnapshot, PersonaCardService
 from .persona_publish import PersonaPublishService, PublishReceipt
+from .teaching_composition import CompositionError, compose, source_plan
+from ..persistence.persona_card import barrier_blocks
+from ..persistence.persona_content import filter_owned_content
 
 #: The section a teaching writes. Not a new section: the card already has one.
 EXPRESSION_SECTION_ID = "tone"
@@ -137,34 +140,34 @@ _PERSISTENT_MARKERS = (
 _RULE_TABLE: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         r"(?:总结|归纳|罗列|列点|分点|条目|列表|结构化)",
-        ("不要每轮都用条目总结或结论式收尾；主人没要分析时，顺着话题自然接着聊。",),
+        ("我顺着话题自然接着聊；主人需要分析时，我再展开整理。",),
     ),
     (
         r"(?:追问|反问|问个不停|老问|一直问|每轮都问|问太多)",
-        ("不必每轮都追问；主人没有继续的意思时，允许自然收住一句。",),
+        ("我跟着主人的交流意愿接话，聊到合适的地方自然收住一句。",),
     ),
     (
         r"(?:人机|机械|模板|复读|像?\s*AI|公式|套话|念稿|生硬)",
         (
-            "少复述主人刚说过的话，也不做没人要的分析；先回应具体的这一句。",
-            "用日常口语，长短跟着话题走，不要固定开场和固定收尾。",
+            "我先回应主人这一句的具体意思，按当前话题表达自己的想法。",
+            "我用日常口语，长短跟着话题走，开场和收尾自然变化。",
         ),
     ),
     (
         r"(?:啰嗦|冗长|太长|话太多|废话|简短|短一点|精简)",
-        ("回答更短，先说结论；除非主人要细节，不要展开长篇。",),
+        ("我回答更短，先说重点，再按主人的需要补充细节。",),
     ),
     (
         r"(?:冷淡|凶|距离|温柔|放软)",
-        ("语气放软一些，像熟人聊天，可以带一点自己的情绪。",),
+        ("我说话温柔一些，像熟人聊天，自然带着自己的情绪。",),
     ),
     (
         r"(?:黏人|亲近|亲一点|撒娇|多陪|热情|主动)",
-        ("可以更亲近、更主动一点；但主人在忙时不追问、不催。",),
+        ("我可以更亲近、更主动一点；主人在忙时，我给他专注的空间。",),
     ),
     (
         r"(?:表情|颜文字|emoji|符号)",
-        ("轻量使用表情和标点，不要每句都带。",),
+        ("我按语气适量使用表情和标点，让表达自然轻快。",),
     ),
 )
 
@@ -218,9 +221,11 @@ def derive_teaching(source_text: Any) -> DerivedTeaching:
     # Several named problems in one sentence ("太黏人，但我忙时别追问") deserve one
     # line each; categories are independent, and the cap keeps this a small rule
     # rather than a rewrite of the persona.
-    for pattern, lines in _RULE_TABLE:
+    for category, (pattern, lines) in enumerate(_RULE_TABLE):
         if not re.search(pattern, text):
             continue
+        if category >= 4 and _NEGATION_RE.search(text):
+            lines = (_short("我按主人给我的这条要求调整表达：“" + text + "”"),)
         for line in lines:
             cleaned = _short(line)
             if cleaned and cleaned not in rules:
@@ -235,7 +240,7 @@ def derive_teaching(source_text: Any) -> DerivedTeaching:
         body = _short(_LEAD_MARKER_RE.sub("", text))
         if not body:
             return DerivedTeaching(reject_reason=REASON_NOT_STYLE_TEACHING)
-        rules = [_short("按主人在对话里的要求调整表达：" + body)]
+        rules = [_short("我按主人给我的这条要求调整表达：“" + body + "”")]
     return DerivedTeaching(
         intent=INTENT_PERSISTENT, rules=tuple(rules[:MAX_RULES_PER_TEACHING]),
     )
@@ -291,8 +296,8 @@ class PersonaTeachingService:
     Order of one successful teach (design §8.4):
 
     1. derive the target and the rule lines from the saved source text;
-    2. CAS the card under `base_revision`, appending the rule lines to `tone`;
-    3. journal the teaching record (which line belongs to which source);
+    2. compose a complete section, then journal its prepared ownership;
+    3. CAS the card under `base_revision` and record the applied revision;
     4. publish the new revision for `next_turn` only.
 
     A conflict at step 2 writes nothing, and the receipt carries the card so the
@@ -310,6 +315,8 @@ class PersonaTeachingService:
         clock: Clock,
         permit: WritePermit,
         barrier: Any = None,
+        model: Any = None,
+        evidence_reader: Any = None,
     ) -> None:
         self._roots = roots
         self._store = store
@@ -319,6 +326,8 @@ class PersonaTeachingService:
         self._clock = clock
         self._permit = permit
         self._barrier = barrier
+        self._model = model
+        self._evidence_reader = evidence_reader
         self._locks: dict[str, threading.RLock] = {}
         self._locks_guard = threading.Lock()
         self._journal.register_handler(TEACHING_EVENT_TYPE, self._replay_teaching)
@@ -367,13 +376,18 @@ class PersonaTeachingService:
         if section is None:
             return ()
         present = set(_lines(str(section.text or "")))
+        compositions = [record.get("composition") for record in self._store.all(character)
+                        if isinstance(record.get("composition"), Mapping)]
+        latest = max(compositions, key=lambda row: (int(row.get("applied_revision") or 0), int(row.get("sequence") or 0)), default={})
+        owned_ids = {ref for paragraph in latest.get("paragraphs") or ()
+                     if paragraph["text"] in section.text for ref in paragraph["refs"]}
         out: list[Mapping[str, Any]] = []
         for teaching in self._store.all(character):
             if teaching.get("status") != STATUS_ACTIVE:
                 continue
             for rule in teaching.get("rules") or ():
                 line = str(rule.get("line") or rule.get("text") or "")
-                if line and line in present:
+                if not rule.get("superseded_by") and line and (line in present or rule.get("rule_id") in owned_ids):
                     out.append({
                         "rule_id": str(rule.get("rule_id") or ""),
                         "teaching_id": str(teaching.get("teaching_id") or ""),
@@ -397,253 +411,198 @@ class PersonaTeachingService:
 
     # -- teach ----------------------------------------------------------
 
-    def teach(
-        self, character: str, request: TeachRequest | Mapping[str, Any],
-    ) -> TeachingReceipt:
-        """Append the rules of one saved user message to the tone section."""
+    def teach(self, character: str, request: TeachRequest | Mapping[str, Any]) -> TeachingReceipt:
+        return asyncio.run(self.ateach(character, request))
+
+    async def ateach(self, character: str, request: TeachRequest | Mapping[str, Any]) -> TeachingReceipt:
         character = self._character(character)
         try:
             req = self._normalize_request(request)
         except _Rejected as exc:
             return TeachingReceipt(status="rejected", reason=exc.reason)
+        teaching_id = _teaching_id(character, req["subject"], req["source_key"])
         with self._lock(character):
             card = self._card_service.get(character)
-            if card.revision <= 0:
-                return TeachingReceipt(
-                    status="rejected", reason=REASON_CARD_NOT_INITIALIZED, card=card,
-                )
-            teaching_id = _teaching_id(character, req["subject"], req["source_key"])
-            if req["base_revision"] != card.revision:
-                return TeachingReceipt(
-                    status="conflict", conflict=True,
-                    reason=REASON_BASE_CONFLICT,
-                    teaching_id=teaching_id,
-                    base_revision=req["base_revision"],
-                    revision=card.revision, card=card,
-                )
-            # Idempotency: one saved message is one teaching, however many times
-            # it is submitted. A revoked teaching stays revoked (the user made a
-            # decision); only a different source creates a new record.
             existing = self._store.get(character, teaching_id)
-            if existing is not None:
+            if existing is not None and existing.get("status") != STATUS_PENDING:
+                if existing.get("status") == STATUS_ACTIVE and req["base_revision"] not in (existing.get("base_revision"), card.revision):
+                    return self._conflict(card, teaching_id, req["base_revision"])
                 return self._duplicate(existing, card)
+            if existing is not None:
+                resumed = self._resume(character, existing, card)
+                if resumed is not None:
+                    return resumed
+            if req["base_revision"] != card.revision:
+                return self._conflict(card, teaching_id, req["base_revision"])
+            if card.revision <= 0:
+                return TeachingReceipt(status="rejected", reason=REASON_CARD_NOT_INITIALIZED, card=card)
             derived = derive_teaching(req["source_text"])
             if derived.intent == INTENT_TRANSIENT:
-                # "This time shorter": the current reply obeys it; nothing is
-                # written to the card (design §8.1, G03).
-                return TeachingReceipt(
-                    status="transient", intent=INTENT_TRANSIENT,
-                    teaching_id=teaching_id, revision=card.revision,
-                    base_revision=req["base_revision"], card=card,
-                )
-            if derived.reject_reason is not None or not derived.rules:
-                return TeachingReceipt(
-                    status="rejected",
-                    reason=derived.reject_reason or REASON_NO_RULES,
-                    teaching_id=teaching_id, card=card,
-                )
-            section = next(
-                (s for s in card.sections if s.section_id == EXPRESSION_SECTION_ID),
-                None,
-            )
+                return TeachingReceipt(status="transient", intent=INTENT_TRANSIENT, teaching_id=teaching_id,
+                                        revision=card.revision, base_revision=card.revision, card=card)
+            if derived.reject_reason or not derived.rules:
+                return TeachingReceipt(status="rejected", reason=derived.reject_reason or REASON_NO_RULES, card=card)
+            section = self._section(character)
             if section is not None and section.frozen:
-                # A frozen section is the user's "do not change this". A teaching
-                # is derived from chat text, so it must not override that by
-                # itself; the persona editor is the way to unfreeze.
-                return TeachingReceipt(
-                    status="rejected", reason=REASON_SECTION_FROZEN,
-                    teaching_id=teaching_id, card=card,
-                )
+                return TeachingReceipt(status="rejected", reason=REASON_SECTION_FROZEN, card=card)
             rules = self._build_rules(character, req, derived.rules)
-            try:
-                text, section_ops, superseded = self._compose_section(
-                    character, section, rules,
-                )
-            except _Rejected as exc:
-                return TeachingReceipt(
-                    status="rejected", reason=exc.reason,
-                    teaching_id=teaching_id, card=card,
-                )
-            now = self._now_iso()
-            # Deliberately no source_refs on the card operation: a section ref
-            # makes the deletion cleaner drop the *whole* section when that one
-            # source is deleted, which would take hand-written tone prose with
-            # it. Provenance lives in the teaching log instead.
-            receipt = self._card_service.revise(character, {
-                "base_revision": req["base_revision"],
-                "operations": section_ops,
-                "reason": "explicit_teaching",
-                "origin": ORIGIN_TEACHING,
-                "actor": req["teacher"],
-            })
-            if receipt.conflict:
-                return TeachingReceipt(
-                    status="conflict", conflict=True,
-                    reason=REASON_BASE_CONFLICT,
-                    teaching_id=teaching_id,
-                    base_revision=req["base_revision"],
-                    revision=card.revision, card=card,
-                )
-            if receipt.status == "rejected":
-                return TeachingReceipt(
-                    status="rejected", reason=receipt.reason or "rejected",
-                    teaching_id=teaching_id, card=card,
-                )
-            # Only after the card holds the lines is it safe to record which
-            # source owns them: a crash in between leaves lines with no teaching,
-            # which the read path treats as ordinary authored tone text.
-            self._supersede_previous(character, superseded, now)
-            record = {
-                "teaching_id": teaching_id,
-                "character": character,
-                "subject": req["subject"],
-                "status": STATUS_ACTIVE,
-                "source_key": req["source_key"],
-                "source_text": req["source_text"][:MAX_SOURCE_TEXT],
-                "source_content_class": req["content_class"],
-                "intent": INTENT_PERSISTENT,
-                "rules": rules,
-                "client_id": req["client_id"],
-                "base_revision": req["base_revision"],
-                "revision": receipt.revision,
-                "published_version": "",
-                "created_at": now,
-                "updated_at": now,
-            }
-            example = req.get("quoted_example")
-            if isinstance(example, Mapping):
-                # An authorised example is stored *by reference*: the rule cites
-                # it, the model never reads it, and it is never replayed as text
-                # to imitate word for word (design §8.2-§8.3).
-                record["quoted_example"] = {
-                    "source_key": str(example.get("source_key") or "")[:MAX_SOURCE_TEXT],
-                    "text": str(example.get("text") or "")[:MAX_SOURCE_TEXT],
-                }
-            self._store.record(character, {"teaching": record}, journal=self._journal)
-            published_version = self._publish(character, receipt.revision)
-            if published_version:
-                record["published_version"] = published_version
-                # Recorded once more so the log says which version carried this
-                # rule; the snapshot merge ignores an identical record.
-                self._store.record(
-                    character, {"teaching": record}, journal=self._journal,
-                )
-            return TeachingReceipt(
-                status="applied", teaching_id=teaching_id,
-                intent=INTENT_PERSISTENT, revision=receipt.revision,
-                base_revision=req["base_revision"],
-                published_version=published_version,
-                target=req["target"],
-                rules=tuple(_rule_view(item) for item in rules),
-                card=self._card_service.get(character),
-            )
+            records = self._store.all(character)
+            growth = self._growth(character, section)
+            plan = source_plan(section, records, rules, revision=card.revision, growth=growth)
+            barrier = self._barrier.snapshot(character) if self._barrier is not None else None
+        try:
+            composition = await compose(plan, self._model)
+        except CompositionError as exc:
+            if str(exc) == REASON_TONE_FULL and self._model is None:
+                # Legacy offline operation: retain hand-written prose, make
+                # room from the oldest learned rule and rebuild its ownership.
+                try:
+                    _, _, dropped = self._compose_section(character, section, rules)
+                    dropped_ids = {row["teaching_id"] for row in dropped}
+                    plan = source_plan(section, [row for row in records if row["teaching_id"] not in dropped_ids],
+                                       rules, revision=card.revision, growth=growth)
+                    for row in dropped:
+                        for rule in row.get("rules") or ():
+                            plan["base_text"], _ = _remove_lines(plan["base_text"], [rule["line"]])
+                    composition = await compose(plan, None)
+                    composition["superseded_teachings"] = list(dropped_ids)
+                except (CompositionError, _Rejected) as retry_exc:
+                    return TeachingReceipt(status="rejected", reason=str(retry_exc), card=card)
+            else:
+                return TeachingReceipt(status="rejected", reason=str(exc), card=card)
+        record = dict(existing or {}, teaching_id=teaching_id, character=character, subject=req["subject"],
+                      source_key=req["source_key"], source_text=req["source_text"], source_content_class=req["content_class"],
+                      intent=INTENT_PERSISTENT, rules=rules, client_id=req["client_id"], base_revision=req["base_revision"],
+                      published_version="", created_at=(existing or {}).get("created_at") or self._now_iso(),
+                      updated_at=self._now_iso(), quoted_example=req.get("quoted_example"), composition=composition,
+                      action="teach", status=STATUS_PENDING, phase="prepared")
+        return self._commit_composition(character, record, card, section, barrier)
 
-    # -- revoke ---------------------------------------------------------
+    def revoke(self, character: str, payload: Mapping[str, Any]) -> TeachingReceipt:
+        return asyncio.run(self.arevoke(character, payload))
 
-    def revoke(
-        self, character: str, payload: Mapping[str, Any],
-    ) -> TeachingReceipt:
-        """Withdraw one teaching's rule lines; every other rule stays."""
+    async def arevoke(self, character: str, payload: Mapping[str, Any]) -> TeachingReceipt:
         character = self._character(character)
         base_revision = payload.get("base_revision")
         if isinstance(base_revision, bool) or not isinstance(base_revision, int):
             return TeachingReceipt(status="rejected", reason=REASON_INVALID_REQUEST)
-        teaching_id = str(payload.get("teaching_id") or "").strip()
-        source_key = str(payload.get("source_key") or "").strip()
         with self._lock(character):
             card = self._card_service.get(character)
-            record = None
-            if teaching_id:
-                record = self._store.get(character, teaching_id)
-            elif source_key:
-                record = self._store.by_source(character, source_key)
-            if record is None:
-                return TeachingReceipt(
-                    status="rejected", reason=REASON_UNKNOWN_TEACHING,
-                    teaching_id=teaching_id, revision=card.revision, card=card,
-                )
-            teaching_id = str(record.get("teaching_id") or "")
+            record = (self._store.get(character, str(payload.get("teaching_id") or "")) if payload.get("teaching_id")
+                      else self._store.by_source(character, str(payload.get("source_key") or "")))
+            if record is None or record.get("subject", "private") != payload.get("subject", "private"):
+                return TeachingReceipt(status="rejected", reason=REASON_UNKNOWN_TEACHING, card=card)
+            teaching_id = str(record["teaching_id"])
             if record.get("status") == STATUS_REVOKED:
-                return TeachingReceipt(
-                    status="duplicate", duplicate=True,
-                    reason=REASON_ALREADY_REVOKED, teaching_id=teaching_id,
-                    revision=card.revision,
-                    published_version=self._current_version(character),
-                    card=card,
-                )
+                return TeachingReceipt(status="duplicate", duplicate=True, reason=REASON_ALREADY_REVOKED,
+                                        teaching_id=teaching_id, revision=card.revision, card=card)
+            if record.get("status") == STATUS_PENDING and record.get("action") == "revoke":
+                resumed = self._resume(character, record, card)
+                if resumed is not None:
+                    return resumed
             if base_revision != card.revision:
-                return TeachingReceipt(
-                    status="conflict", conflict=True,
-                    reason=REASON_BASE_CONFLICT, teaching_id=teaching_id,
-                    base_revision=base_revision, revision=card.revision,
-                    card=card,
-                )
-            section = next(
-                (s for s in card.sections if s.section_id == EXPRESSION_SECTION_ID),
-                None,
-            )
+                return self._conflict(card, teaching_id, base_revision)
+            section = self._section(character)
             if section is None:
-                return TeachingReceipt(
-                    status="rejected", reason=REASON_UNKNOWN_TEACHING,
-                    teaching_id=teaching_id, card=card,
-                )
-            owned = [
-                str(rule.get("line") or rule.get("text") or "")
-                for rule in record.get("rules") or ()
-            ]
-            kept, removed = _remove_lines(str(section.text or ""), owned)
-            revision = card.revision
-            if removed:
-                receipt = self._card_service.revise(character, {
-                    "base_revision": base_revision,
-                    "operations": [{
-                        "op": "replace", "section_id": EXPRESSION_SECTION_ID,
-                        "text": kept,
-                    }],
-                    "reason": "explicit_teaching_revoked",
-                    "origin": ORIGIN_TEACHING,
-                    "actor": "user",
-                })
-                if receipt.conflict:
-                    return TeachingReceipt(
-                        status="conflict", conflict=True,
-                        reason=REASON_BASE_CONFLICT,
-                        teaching_id=teaching_id, base_revision=base_revision,
-                        revision=card.revision, card=card,
-                    )
-                revision = receipt.revision or card.revision
-            # No line of this teaching is in the card any more (the user edited
-            # or deleted it by hand). Nothing to remove from the card, but the
-            # teaching itself is still what they asked to drop, so the log
-            # records the decision at the revision we have.
-            now = self._now_iso()
-            updated = dict(record)
-            updated.update({
-                "status": STATUS_REVOKED,
-                "revoked_at": now,
-                "updated_at": now,
-                "revoke_reason": str(payload.get("reason") or "user_requested")[:200],
-                "revoked_revision": revision,
-                "removed_lines": removed,
-            })
-            self._store.record(
-                character, {"teaching": updated}, journal=self._journal,
-            )
-            published_version = (
-                self._publish(character, revision) if removed else
-                self._current_version(character)
-            )
-            if published_version:
-                updated["published_version"] = published_version
-                self._store.record(
-                    character, {"teaching": updated}, journal=self._journal,
-                )
-            return TeachingReceipt(
-                status="revoked", teaching_id=teaching_id,
-                revision=revision, base_revision=base_revision,
-                published_version=published_version, target="next_turn",
-                rules=(), card=self._card_service.get(character),
-            )
+                return TeachingReceipt(status="rejected", reason=REASON_UNKNOWN_TEACHING, card=card)
+            records = self._store.all(character)
+            plan = source_plan(section, records, [], revision=card.revision, exclude=teaching_id,
+                               growth=self._growth(character, section))
+            barrier = self._barrier.snapshot(character) if self._barrier is not None else None
+        try:
+            composition = await compose(plan, self._model)
+        except CompositionError as exc:
+            return TeachingReceipt(status="rejected", reason=str(exc), card=card)
+        updated = dict(record, action="revoke", status=STATUS_PENDING, phase="prepared", composition=composition,
+                       base_revision=base_revision, updated_at=self._now_iso(),
+                       revoke_reason=str(payload.get("reason") or "user_requested")[:200])
+        return self._commit_composition(character, updated, card, section, barrier)
+
+    @staticmethod
+    def _conflict(card, teaching_id, base):
+        return TeachingReceipt(status="conflict", conflict=True, reason=REASON_BASE_CONFLICT,
+                                teaching_id=teaching_id, base_revision=base, revision=card.revision, card=card)
+
+    def _growth(self, character, section):
+        if self._evidence_reader is None or section is None or not section.source_refs:
+            return []
+        wanted = set(section.source_refs)
+        return [row for row in self._evidence_reader(character) if row.get("id") in wanted
+                and (row.get("evidence") or {}).get("eligible")
+                and (self._barrier is None or not self._barrier.blocks_row(character, row))]
+
+    def _commit_composition(self, character, record, card, section, barrier):
+        with self._lock(character):
+            current = self._card_service.get(character)
+            if current.revision != card.revision:
+                return self._conflict(current, record["teaching_id"], card.revision)
+            if self._barrier is not None and (self._barrier.is_stale(character, barrier)
+                    or self._barrier.blocks_source_key(character, record["source_key"])):
+                return TeachingReceipt(status="rejected", reason="sources_changed", card=current)
+            latest = self._store.get(character, record["teaching_id"])
+            if latest is not None and latest.get("status") == STATUS_REVOKED and record["action"] == "teach":
+                return self._duplicate(latest, current)
+            record["operation_id"] = record["teaching_id"] + ":" + record["action"] + ":" + str(card.revision)
+            self._store.record(character, {"teaching": record}, journal=self._journal)
+            op = {"op": "replace" if section is not None else "add", "section_id": EXPRESSION_SECTION_ID,
+                  "text": record["composition"]["text"], "content_basis": record["composition"]}
+            if not op["text"] and section is not None:
+                op = {"op": "delete", "section_id": EXPRESSION_SECTION_ID}
+            if section is None:
+                op.update(kind=EXPRESSION_SECTION_KIND, scope={"subject": "private", "applies_to": "all"},
+                          editable_by={"user": True, "evolution": True})
+            receipt = self._card_service.revise(character, {"base_revision": card.revision, "operations": [op],
+                "reason": record["operation_id"], "origin": ORIGIN_TEACHING, "actor": "user"})
+            if receipt.conflict:
+                return self._conflict(self._card_service.get(character), record["teaching_id"], card.revision)
+            if receipt.status == "rejected":
+                return TeachingReceipt(status="rejected", reason=receipt.reason, card=current)
+            record.update(phase="applied", revision=receipt.revision or card.revision)
+            record["composition"]["applied_revision"] = record["revision"]
+            self._store.record(character, {"teaching": record}, journal=self._journal)
+            return self._finish(character, record)
+
+    def _resume(self, character, record, card):
+        if record.get("phase") == "prepared":
+            applied = next((row for row in card.revisions if row.reason == record.get("operation_id")), None)
+            if applied is None:
+                return None
+            record = dict(record, revision=applied.revision, phase="applied")
+        if record.get("phase") == "applied" and int(record.get("revision") or 0) == card.revision:
+            return self._finish(character, dict(record))
+        return None
+
+    def _finish(self, character, record):
+        try:
+            version = self._publish(character, record["revision"])
+        except Exception as exc:
+            return TeachingReceipt(status="pending", reason=f"publish:{type(exc).__name__}",
+                                    teaching_id=record["teaching_id"], revision=record["revision"])
+        if self._publish_service is not None and not version:
+            return TeachingReceipt(status="pending", reason="publish_pending", teaching_id=record["teaching_id"], revision=record["revision"])
+        record.update(status=STATUS_REVOKED if record["action"] == "revoke" else STATUS_ACTIVE,
+                      phase="completed", published_version=version, updated_at=self._now_iso())
+        record["composition"]["applied_revision"] = record["revision"]
+        if record["action"] == "revoke":
+            record.update(revoked_at=self._now_iso(), revoked_revision=record["revision"])
+        self._store.record(character, {"teaching": record}, journal=self._journal)
+        superseded = set(record["composition"].get("superseded_rule_ids") or ())
+        for old in self._store.all(character):
+            if old["teaching_id"] == record["teaching_id"] or old.get("status") != STATUS_ACTIVE:
+                continue
+            if old["teaching_id"] in record["composition"].get("superseded_teachings", []):
+                old.update(status=STATUS_SUPERSEDED, superseded_at=self._now_iso())
+            for rule in old.get("rules") or ():
+                if rule["rule_id"] in superseded:
+                    rule["superseded_by"] = record["teaching_id"]
+            if old.get("rules") and all(rule.get("superseded_by") for rule in old["rules"]):
+                old.update(status=STATUS_SUPERSEDED, superseded_at=self._now_iso())
+            self._store.record(character, {"teaching": old}, journal=self._journal)
+        return TeachingReceipt(status="revoked" if record["action"] == "revoke" else "applied",
+                                teaching_id=record["teaching_id"], intent=INTENT_PERSISTENT,
+                                revision=record["revision"], base_revision=record["base_revision"],
+                                published_version=version, target="next_turn", rules=tuple(_rule_view(row) for row in record["rules"]),
+                                card=self._card_service.get(character))
 
     # -- internals ------------------------------------------------------
 
@@ -713,6 +672,8 @@ class PersonaTeachingService:
                 "rule_id": "%s:r%d" % (stamp, index + 1),
                 "text": _short(text),
                 "line": _short(text),
+                "source_key": req["source_key"],
+                "instruction": req["source_text"],
             })
             if example_ref:
                 rules[-1]["example_ref"] = example_ref
@@ -828,6 +789,54 @@ class PersonaTeachingService:
 
     # -- replay ---------------------------------------------------------
 
+    def retry_pending(self, character: str) -> int:
+        completed = 0
+        with self._lock(character):
+            for record in self._store.all(character):
+                if record.get("status") != STATUS_PENDING:
+                    continue
+                card = self._card_service.get(character)
+                result = self._resume(character, record, card)
+                if result is None and record.get("phase") == "prepared" and record.get("base_revision") == card.revision:
+                    result = self._commit_composition(character, dict(record), card, self._section(character),
+                        self._barrier.snapshot(character) if self._barrier else None)
+                if result is not None and result.status in ("applied", "revoked"):
+                    completed += 1
+        return completed
+
+    def cleanup(self, character: str, resolved: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Remove deleted source copies from ownership, history and pending edits."""
+        changed = 0
+        for record in self._store.all(character):
+            if self._barrier.blocks_source_key(character, record.get("source_key", "")):
+                record.update(status=STATUS_REVOKED, phase="completed", source_text="", rules=[],
+                              updated_at=self._now_iso(), revoke_reason="source_deleted")
+                record.pop("quoted_example", None)
+                record.pop("composition", None)
+            elif record.get("composition"):
+                record["composition"] = filter_owned_content(
+                    {"content_basis": record["composition"], "text": record["composition"]["text"]},
+                    lambda ref: barrier_blocks(self._barrier, character, ref))["content_basis"]
+            self._store.record(character, {"teaching": record}, journal=self._journal)
+            changed += 1
+        card = self._card_service.get(character)
+        if changed and card.revision:
+            self._card_service._store.purge_owned_sources(character)
+            self._publish(character, card.revision)
+        return {"status": "completed", "detail": {"teaching_records_checked": changed}}
+
+    def invalidate(self, character: str, fact_ids: Sequence[str], **kwargs) -> Mapping[str, Any]:
+        targets = set(fact_ids)
+        for record in self._store.all(character):
+            composition = record.get("composition")
+            if composition:
+                filtered = filter_owned_content({"text": composition["text"], "content_basis": composition},
+                                                lambda ref: ref in targets)["content_basis"]
+                if filtered != composition:
+                    record["composition"] = filtered
+                    self._store.record(character, {"teaching": record}, journal=self._journal)
+        return {}
+
     def _replay_teaching(
         self, character: str, payload: Mapping[str, Any],
     ) -> bool:
@@ -836,6 +845,16 @@ class PersonaTeachingService:
             raise RuntimeError(
                 "core.persona_teaching_recorded payload is not an object",
             )
+        record = payload.get("teaching") or {}
+        if self._barrier is not None and self._barrier.blocks_source_key(character, record.get("source_key", "")):
+            if record.get("source_text") or record.get("rules") or record.get("composition"):
+                return False
+        if record.get("composition") and self._barrier is not None:
+            record = dict(record)
+            record["composition"] = filter_owned_content(
+                {"content_basis": record["composition"], "text": record["composition"]["text"]},
+                lambda ref: barrier_blocks(self._barrier, character, ref))["content_basis"]
+            payload = {"teaching": record}
         view = self._store.load_view(character)
         if not self._store.apply_snapshot(view, payload):
             return False

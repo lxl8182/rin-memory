@@ -188,7 +188,7 @@ class TeachingTests(ServiceCase):
         self.assertEqual(result["revision"], before["revision"] + 1)
         after = self.card()
         # The rule landed in the existing tone section; identity is untouched.
-        self.assertIn("主人没要分析时", self.tone())
+        self.assertIn("我顺着话题自然接着聊", self.tone())
         identity = next(section for section in after["sections"]
                         if section["section_id"] == "identity")
         self.assertEqual(identity["text"], "名字: 小潮\n温柔而直白。")
@@ -203,12 +203,12 @@ class TeachingTests(ServiceCase):
         """G01/G06: the next generation reads it, with evolution off."""
         self.record_message("t1", GREETING)
         before = asyncio.run(self.api.context(dict(self.scope, text="今天好累")))
-        self.assertNotIn("主人没要分析时", before["persona"])
+        self.assertNotIn("我顺着话题自然接着聊", before["persona"])
         self.assertEqual(before["expression"]["rules"], [])
         result = self.teach("host:test:private:t1")
         after = asyncio.run(self.api.context(dict(self.scope, text="今天好累")))
         # The persona text the model reads now carries the rule.
-        self.assertIn("主人没要分析时", after["persona"])
+        self.assertIn("我顺着话题自然接着聊", after["persona"])
         self.assertEqual(after["expression"]["section_id"],
                          EXPRESSION_SECTION_ID)
         self.assertEqual(after["expression"]["tone_version"],
@@ -236,7 +236,7 @@ class TeachingTests(ServiceCase):
         # No second revision, no repeated weight, no duplicated line.
         self.assertEqual(self.card()["revision"], revision)
         self.assertEqual(self.tone(), tone)
-        self.assertEqual(self.tone().count("主人没要分析时"), 1)
+        self.assertEqual(self.tone().count("我顺着话题自然接着聊"), 1)
         self.assertEqual(len(self.service.persona_teaching.rules("test")), 1)
 
     def test_a_stale_base_revision_conflicts_and_carries_the_current_card(self):
@@ -303,7 +303,7 @@ class SectionShapeTests(ServiceCase):
         section = next(section for section in self.card()["sections"]
                        if section["section_id"] == EXPRESSION_SECTION_ID)
         self.assertEqual(section["kind"], EXPRESSION_SECTION_ID)
-        self.assertIn("主人没要分析时", section["text"])
+        self.assertIn("我顺着话题自然接着聊", section["text"])
         self.assertFalse(section["frozen"])
         # The identity section is still the one the card started with.
         identity = next(section for section in self.card()["sections"]
@@ -342,7 +342,7 @@ class SectionShapeTests(ServiceCase):
         self.assertEqual(result["status"], "applied")
         tone = self.tone()
         # The old taught line made way; the hand-written prose is intact.
-        self.assertNotIn("主人没要分析时", tone)
+        self.assertNotIn("我顺着话题自然接着聊", tone)
         self.assertIn("手写补充", tone)
         self.assertIn("回答更短", tone)
         superseded = self.service.persona_teaching.teaching(
@@ -400,12 +400,12 @@ class RevocationTests(ServiceCase):
         second = self.teach("host:test:private:t2")
         self.assertNotEqual(first["teaching_id"], second["teaching_id"])
         tone = self.tone()
-        self.assertIn("主人没要分析时", tone)
+        self.assertIn("我顺着话题自然接着聊", tone)
         self.assertIn("更亲近", tone)
         revoked = self.revoke(teaching_id=first["teaching_id"])
         self.assertEqual(revoked["status"], "revoked")
         tone_after = self.tone()
-        self.assertNotIn("主人没要分析时", tone_after)
+        self.assertNotIn("我顺着话题自然接着聊", tone_after)
         self.assertIn("更亲近", tone_after)
         # The hand-written tone text survives, and the other rule is still live.
         self.assertIn("说话温柔", tone_after)
@@ -426,10 +426,10 @@ class RevocationTests(ServiceCase):
             lambda: self.revoke(teaching_id=result["teaching_id"],
                                 base=result["revision"] - 1))
         self.assertEqual(error.extra["current"]["revision"], result["revision"])
-        self.assertIn("主人没要分析时", self.tone())
+        self.assertIn("我顺着话题自然接着聊", self.tone())
         revoked = self.revoke(source_key="host:test:private:t1")
         self.assertEqual(revoked["status"], "revoked")
-        self.assertNotIn("主人没要分析时", self.tone())
+        self.assertNotIn("我顺着话题自然接着聊", self.tone())
 
     def test_revoking_an_unknown_teaching_is_refused(self):
         self.assert_api_error("rejected", lambda: self.revoke(
@@ -461,7 +461,7 @@ class RestartTests(ServiceCase):
         self.assertEqual(len(rules), 1)
         self.assertEqual(rules[0]["teaching_id"], result["teaching_id"])
         context = asyncio.run(self.api.context(dict(self.scope, text="今天好累")))
-        self.assertIn("主人没要分析时", context["persona"])
+        self.assertIn("我顺着话题自然接着聊", context["persona"])
         self.assertEqual(context["projection"][EXPRESSION_SECTION_ID], tone)
         # And the teaching log itself survived, not just the card text.
         stored = self.service.persona_teaching.teaching(

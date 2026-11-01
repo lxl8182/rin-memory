@@ -108,7 +108,7 @@ class ExtractionFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("assistant | 可以选小号杯或大号杯", prompt)
         self.assertNotIn("别的会话秘密", prompt)
         self.assertNotIn("秘密建议", prompt)
-        self.assertNotIn("本轮未确认的推测", prompt)
+        self.assertIn("assistant | 本轮未确认的推测", prompt)
         self.assertIn("临时操作、一次性尺寸调整", prompt)
         self.assertIn("event_when 是可选字段", prompt)
         self.assertNotIn('"offset": -1', prompt)
@@ -140,7 +140,7 @@ class ExtractionFlowTests(unittest.IsolatedAsyncioTestCase):
             "demo", [message], source_key="plugin:sts2_autoplay:demo:private:r1:msg1",
             content_class="life_fact", session_id="r1",
         )
-        self.assertIn("只提取游戏之外的生活事实和通用相处偏好", model.calls[0]["messages"][0]["content"])
+        self.assertIn("提取游戏之外的生活事实和通用相处偏好", model.calls[0]["messages"][0]["content"])
         life = core.facts.load("demo")[0]
         self.assertEqual(life["text"], "用户明天出差")
         self.assertFalse(life.get("applies_to"))
@@ -239,14 +239,14 @@ class ExtractionFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "extracted")
         prompt = model.calls[0]["messages"][0]["content"]
         self.assertIn("user | 今天下雨了", prompt)
-        self.assertNotIn("我其实喜欢雨天", prompt)
+        self.assertIn("assistant | 我其实喜欢雨天", prompt)
         rows = core.facts.load("demo")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["source"], "ai_disclosure")
         self.assertEqual(rows[0]["entity"], "neko")
         self.assertTrue(rows[0]["signal_processed"])
 
-        second = FakeModel([candidates({"text": "角色喜欢雨天", "source": "user_observation"})])
+        second = FakeModel([candidates({"text": "角色喜欢雨天", "entity": "neko", "source": "user_observation"})])
         core.extraction._model = second  # same data root, new model stand-in
         upgraded = await core.extraction.ingest_turn(
             "demo", [human("我也喜欢雨天", "host:demo:private:e3")],

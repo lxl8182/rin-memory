@@ -212,7 +212,7 @@ class PluginGateTests(ServiceHarness):
         self.assertEqual(payload["status"], "applied", payload)
         self.assertTrue(payload["published_version"])
         # The derived rule really landed in the tone section.
-        self.assertIn("总结", self.tone())
+        self.assertIn("自然接着聊", self.tone())
 
     def test_the_same_plugin_is_refused_when_not_trusted(self):
         """The easiest case to miss: capability yes, plugin id not in the list."""
@@ -258,7 +258,7 @@ class PluginGateTests(ServiceHarness):
         # A host source teaches with an empty trusted_plugins list: unchanged.
         status, payload = self.teach(host_key, client="desk")
         self.assertEqual(status, 200, payload)
-        self.assertIn("总结", self.tone())
+        self.assertIn("自然接着聊", self.tone())
         # ...and a host source outside this subject is still rejected.
         status, payload = self.teach("host:test:friend:h9", client="desk")
         self.assertEqual(status, 403, payload)

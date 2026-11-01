@@ -346,7 +346,8 @@ class MemoryApi:
         persona_text = context["persona"]
         memory_block = context["context"].get("context") or ""
         corrections = context["corrections"]["block"]
-        system = "\n\n".join(part for part in (persona_text, corrections, memory_block) if part)
+        awareness = (context.get("memory_awareness") or {}).get("text", "")
+        system = "\n\n".join(part for part in (persona_text, awareness, corrections, memory_block) if part)
         history = [
             {"role": "assistant" if item.get("type") == "ai" else "user",
              "content": str((item.get("data") or {}).get("content") or "")}

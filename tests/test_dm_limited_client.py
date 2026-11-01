@@ -48,8 +48,8 @@ class FakeModel:
                 str(message.get("content") or "") for message in messages
                 if isinstance(message, dict)
             )
-            lines = [line[len("user | "):] for line in prompt.splitlines()
-                     if line.startswith("user | ")]
+            lines = [line.split("| user |", 1)[-1].split("| message_ref=", 1)[0].strip()
+                     for line in prompt.splitlines() if "| user |" in line]
             text = (lines[-1] if lines else "").strip().rstrip("。")
             if not text:
                 return "[]"

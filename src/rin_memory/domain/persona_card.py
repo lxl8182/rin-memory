@@ -31,6 +31,7 @@ from __future__ import annotations
 import copy
 import re
 import threading
+from ..persistence.persona_content import filter_owned_tree
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
@@ -162,6 +163,7 @@ class CardSection:
     invalidated_at: str | None = None
     invalidated_sources: tuple[str, ...] = ()
     needs_rebuild: bool = False
+    content_basis: Mapping[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, row: Mapping[str, Any]) -> "CardSection":
@@ -202,10 +204,12 @@ class CardSection:
                 if isinstance(item, str) and item
             ) if isinstance(invalidated, (list, tuple)) else (),
             needs_rebuild=bool(row.get("needs_rebuild")),
+            content_basis=dict(row.get("content_basis") or {}),
         )
 
     def to_mapping(self) -> dict[str, Any]:
         return {
+            "content_basis": copy.deepcopy(dict(self.content_basis)),
             "section_id": self.section_id,
             "text": self.text,
             "kind": self.kind,
@@ -973,7 +977,7 @@ class PersonaCardService:
                 if len(text) > MAX_SECTION_TEXT:
                     raise _Rejected("text_too_long")
                 op["text"] = text
-            for key in ("kind", "scope", "editable_by", "frozen"):
+            for key in ("kind", "scope", "editable_by", "frozen", "content_basis"):
                 if key in raw:
                     op[key] = copy.deepcopy(raw[key])
             op["source_refs"] = _normalize_refs(raw.get("source_refs"))
@@ -1049,6 +1053,7 @@ class PersonaCardService:
                 "revision": 0,
                 "updated_at": now,
                 "history": [],
+                "content_basis": copy.deepcopy(op.get("content_basis") or {}),
             }
             sections.append(section)
             by_id[section_id] = section
@@ -1070,6 +1075,7 @@ class PersonaCardService:
         # section: freezing a section by hand, opening it to evolution, or
         # binding it to another subject must not require inventing a text change
         # (that would write a revision whose only real purpose was a flag).
+        old_basis = copy.deepcopy(existing.get("content_basis") or {})
         metadata_changed = self._apply_metadata(existing, op)
         if op_type == "replace":
             new_text = str(op.get("text") or "")
@@ -1094,6 +1100,7 @@ class PersonaCardService:
             "replaced_at": now,
             "reason": req.get("reason") or "",
             "origin": req["origin"],
+            "content_basis": old_basis,
         })
         existing["history"] = history[-self._store.history_limit:]
         existing["text"] = new_text
@@ -1115,6 +1122,9 @@ class PersonaCardService:
         revisions with an audit record instead of side effects of a text edit.
         """
         changed = False
+        if "content_basis" in op:
+            changed = section.get("content_basis") != op["content_basis"]
+            section["content_basis"] = copy.deepcopy(op["content_basis"])
         if "kind" in op:
             kind = _bounded(op.get("kind"), MAX_KIND_CHARS) or section.get("kind")
             if kind != section.get("kind"):
@@ -1335,7 +1345,10 @@ class PersonaCardInvalidator:
         if not targets:
             return {"card_ids": []}
         card = self._store.load(character)
-        changed_ids: list[str] = []
+        filtered = filter_owned_tree(card, lambda ref: ref in targets)
+        changed_ids = [str(section["section_id"]) for section in card.get("sections") or []
+                       if section != next((row for row in filtered.get("sections") or [] if row["section_id"] == section["section_id"]), section)]
+        card = filtered
         affected_section_ids: set[str] = set()
         sections: list[dict[str, Any]] = []
         for raw in card.get("sections") or []:

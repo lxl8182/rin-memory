@@ -608,6 +608,15 @@ class PersonaPublishService:
     def _card_source_refs(self, character: str, card: Any) -> list[str]:
         refs: list[str] = []
         for section in getattr(card, "sections", ()) or ():
+            basis = getattr(section, "content_basis", {}) or {}
+            for rule in basis.get("rules") or ():
+                key = rule.get("source_key")
+                if key and key not in refs:
+                    refs.append(key)
+            for growth in basis.get("growth") or ():
+                for key in [growth["id"], *(growth.get("source_keys") or ())]:
+                    if key and key not in refs:
+                        refs.append(key)
             for ref in getattr(section, "source_refs", ()) or ():
                 if isinstance(ref, str) and ref and ref not in refs:
                     refs.append(ref)
@@ -620,6 +629,8 @@ class PersonaPublishService:
             return False
         # Any deleted source makes this card version unsafe to publish.
         for ref in refs:
+            if self._barrier.blocks_source_key(character, ref):
+                return True
             for target_type in ("fact", "reflection", "persona", "growth"):
                 try:
                     if self._barrier.blocks_target(character, target_type, ref):

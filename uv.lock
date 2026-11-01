@@ -3,6 +3,6 @@ revision = 3
 requires-python = ">=3.11"
 
 [[package]]
-name = "companion-memory"
-version = "0.1.0.dev4"
+name = "rin-memory"
+version = "0.1.0.dev13"
 source = { editable = "." }

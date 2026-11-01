@@ -118,6 +118,10 @@ uv run python webui/server.py --memory-root <根> --allow-write \
 
 客户端身份在 `stack.toml` 配置，令牌只引用环境变量名；未配置身份不能读取私有数据或写入。console 管理本角色；其他客户端只可调用上下文、整轮、事件和自身消费/清理回执。
 
+`memory_awareness` 由核心按客户端能力、反思配置和 `off/propose/auto` 模式生成，包含 `text/version/capabilities`。版本由有效能力与正文确定，同状态保持稳定。网页对话和 DSH 主会话在系统提示中采用一份；旧服务缺少该字段时，DSH 沿用原装配。
+
+明确教导使用独立的 `persona_teach` 授权。`POST /v1/persona/teach` 从已保存的用户来源生成完整表达段落；`POST /v1/persona/teach/revoke` 按来源重组正文。模型等待期间允许其他编辑，提交时复核版本与来源。回执 `pending` 表示人格已保存、发布仍待续接；再次提交同一来源会继续已完成步骤。段落依据保存在现有人格及教导记录中，覆盖改写后的撤回、删除、历史与恢复。
+
 ```toml
 [clients.game-client]
 token_env = 'COMPANION_GAME_TOKEN'
@@ -129,7 +133,7 @@ plugin_id = 'game_plugin'
 
 | 方法和路径 | 请求与结果 |
 |---|---|
-| POST `/v1/context` | text 与作用域；返回固定已发布 persona/version/revision、必需 corrections、可选 context、recent_turns、随机 context_receipt_id、basis；只读，凭据有效期 300 秒 |
+| POST `/v1/context` | text 与作用域；返回固定已发布 persona/version/revision、memory_awareness（text/version/capabilities）、必需 corrections、可选 context、recent_turns、随机 context_receipt_id、basis；只读，凭据有效期 300 秒 |
 | POST `/v1/context/reserve` | 有效上下文凭据与稳定 request_id；在生成前持久登记角色/客户端/主体/会话/场景及人格版本、删除更正依据，不保存人格正文；只供该轮补交，服务重启后仍复核屏障 |
 | POST `/v1/context/validate` | 同作用域与 context_receipt_id；删除、更正、过期、重启或作用域变化返回 409/context_stale、needs_reissue=true；发布新版本不改在途快照 |
 | POST `/v1/turns` | 稳定 request_id/turn_id/source_key/occurred_at、完整 messages/reply；声明生成版本时须带 context_receipt_id；同键异正文或 reply 为 409，失效为 410，持久提交失败为可重试 503 |

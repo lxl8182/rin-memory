@@ -62,6 +62,7 @@ from typing import Any
 from ..errors import CorruptStoreError, InvalidSchemaError
 from ..ports import AtomicJsonStore, Clock, StorageRoots, WritePermit
 from .shards import ArchiveShardStore, is_blank_file
+from .persona_content import filter_owned_tree
 
 CARD_FILENAME = "persona_card.json"
 CARD_ARCHIVE_DIRNAME = "persona_card_archive"
@@ -343,6 +344,7 @@ class PersonaCardStore:
         filtered = copy.deepcopy(dict(card))
         if self._barrier is None:
             return filtered
+        filtered = filter_owned_tree(filtered, lambda ref: barrier_blocks(self._barrier, character, ref))
         filtered["sections"] = [
             section for section in filtered.get("sections") or []
             if not self._section_blocked(character, section)
@@ -398,7 +400,16 @@ class PersonaCardStore:
 
     def load_archive(self, character: str) -> list[dict[str, Any]]:
         """Return every archived revision record across shards."""
-        return self._archive.read_all(character)
+        rows = self._archive.read_all(character)
+        if self._barrier is not None:
+            rows = filter_owned_tree(rows, lambda ref: barrier_blocks(self._barrier, character, ref))
+        return rows
+
+    def purge_owned_sources(self, character: str) -> int:
+        rows = self._archive.read_all(character)
+        affected = [row["id"] for row in rows if filter_owned_tree(
+            row, lambda ref: barrier_blocks(self._barrier, character, ref)) != row]
+        return self._archive.delete_ids(character, affected) if affected else 0
 
     def delete_from_archive(self, character: str, ids: Sequence[str]) -> int:
         """Delete archived rows by id; returns the removed count."""
@@ -488,6 +499,8 @@ def with_name_line(text: Any, name: Any) -> str:
 
 def barrier_blocks(barrier: Any, character: str, ref: str) -> bool:
     """Try one source ref against every id space the barrier may know."""
+    if ref and barrier.blocks_source_key(character, ref):
+        return True
     for target_type in ("fact", "reflection", "persona", "growth"):
         try:
             if barrier.blocks_target(character, target_type, ref):

@@ -64,7 +64,8 @@ STATUS_ACTIVE = "active"
 STATUS_REVOKED = "revoked"
 #: The tone section ran out of room and the oldest rules made way.
 STATUS_SUPERSEDED = "superseded"
-STATUSES = frozenset({STATUS_ACTIVE, STATUS_REVOKED, STATUS_SUPERSEDED})
+STATUS_PENDING = "pending"
+STATUSES = frozenset({STATUS_ACTIVE, STATUS_REVOKED, STATUS_SUPERSEDED, STATUS_PENDING})
 
 #: Bounded log: the newest records survive a trim.
 MAX_TEACHINGS = 200
@@ -118,6 +119,11 @@ def normalize_rule(raw: Any) -> dict[str, Any]:
         "text": text,
         "line": _bounded(raw.get("line"), MAX_TEXT_CHARS) or text,
     }
+    if raw.get("superseded_by"):
+        rule["superseded_by"] = _bounded(raw["superseded_by"], MAX_ID_CHARS)
+    for key in ("instruction", "source_key"):
+        if raw.get(key):
+            rule[key] = _bounded(raw[key], MAX_TEXT_CHARS)
     example_ref = raw.get("example_ref")
     if isinstance(example_ref, str) and example_ref.strip():
         rule["example_ref"] = example_ref.strip()[:MAX_TEXT_CHARS]

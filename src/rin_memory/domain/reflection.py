@@ -69,12 +69,13 @@ import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from ..contracts import MemoryBlock
 from ..domain.barrier import DeletionBarrier, episode_ids_of
 from ..errors import BarrierStaleError, ContentBlockedError
 from ..invalidation import (
+    fact_invalidated,
     normalize_text,
     reflection_invalidated,
     row_matches_subject,
@@ -84,6 +85,11 @@ from ..persistence.facts_view import FactsView
 from ..persistence.journal import EventJournal
 from ..persistence.reflections import ReflectionStore
 from ..ports import Clock, ModelInvoker, StorageRoots, WritePermit
+from .prompt_voice import FIRST_PERSON_VOICE
+from .experience import message_material, message_role, number_messages
+from .persona_card import EXAMPLES_BANNER
+from ..classification import is_extractable, metadata_of
+from .barrier import message_source_keys, message_text
 from .growth_evidence import (
     apply_support_removal_to_row,
     evidence_dto,
@@ -237,7 +243,8 @@ CONTRADICT_REASON = "contradicted_by_new_evidence"
 class ReflectionSettings:
     """B05 policy; defaults mirror the host (B05 spec sections 1, 3, 6.1)."""
 
-    min_facts_for_reflection: int = 5
+    #: Retained for configuration compatibility; one new experience is enough.
+    min_facts_for_reflection: int = 1
     synthesis_facts_max: int = 20
     cooldown_minutes: int = 30
     confirmed_threshold: float = 1.0
@@ -263,6 +270,7 @@ class ReflectionSettings:
     render_max_tokens: int = 2000
     growth_min_support: int = 2
     synthesis_output_tokens: int = 4096
+    synthesis_input_chars: int = 24000
     synthesis_timeout_s: float = 110.0
     model_tier: str = "summary"
     powerful_memory: bool = True
@@ -697,6 +705,9 @@ class ReflectionService:
         model: ModelInvoker | None = None,
         settings: ReflectionSettings | None = None,
         persona: Any = None,
+        persona_reader: Callable[[str], Any] | None = None,
+        timeindex_factory: Any = None,
+        recent: Any = None,
     ) -> None:
         self._roots = roots
         self._store = store
@@ -708,6 +719,9 @@ class ReflectionService:
         self._model = model
         self._settings = settings or ReflectionSettings()
         self._persona = persona
+        self._persona_reader = persona_reader
+        self._timeindex_factory = timeindex_factory
+        self._recent = recent
         self._locks: dict[str, threading.RLock] = {}
         self._locks_guard = threading.Lock()
         # Replay handlers must be registered before any business write
@@ -844,64 +858,69 @@ class ReflectionService:
     async def synthesize(
         self, character: str, *, respect_interval: bool = False,
     ) -> SynthesisOutcome:
-        """Apply one local operation to the existing understandings, if due.
-
-        The model now sees the related old understandings and the strategies
-        already adopted, and answers with exactly one operation (design
-        section 7.2). The three outcomes are not the same thing:
-
-        * `no_change` - the batch was evaluated and nothing new is worth
-          recording. No row is written, no backoff is consumed, and the batch
-          is marked settled so it is not re-evaluated until new evidence
-          arrives (see `_mark_no_change`);
-        * `completed` - one operation was applied (a row added, or an existing
-          row reinforced / refined / retired by supersede, contradict, split);
-        * `failed` - transport, parse or shape failure. This is the only path
-          that consumes the synthesis backoff.
-        """
+        """Process one coherent topic, retaining exact sources and retry state."""
         character = self._character(character)
         settings = self._settings
         with self._lock_for(character):
             unabsorbed = self._unabsorbed_facts(character)
-            if len(unabsorbed) < settings.min_facts_for_reflection:
+            if not unabsorbed:
                 return SynthesisOutcome("skipped", reason="insufficient_facts")
-            all_ids = sorted(str(fact["id"]) for fact in unabsorbed)
-            backoff_key = reflection_id_from_facts(all_ids)
-            backoff = self._store.load_backoff(character)
-            entry = backoff.get(backoff_key) or {}
-            attempts = _as_int(entry.get("n"), 0)
-            if (
-                attempts >= settings.max_synthesis_attempts
-                and not self._dead_letter_healed(entry)
-            ):
-                return SynthesisOutcome("skipped", reason="dead_letter")
-            if respect_interval and not self._normal_synthesis_due(
-                character, settings,
-            ):
-                # New evidence inside the normal interval waits: the batch is
-                # neither settled nor failed, so it is evaluated on a later
-                # round with the same key and the same sources.
+            if respect_interval and not self._normal_synthesis_due(character, settings):
                 return SynthesisOutcome("skipped", reason="normal_interval")
-            if self._no_change_settled(entry):
-                # This exact evidence batch already reported "nothing new".
-                # No model call: the marker lives on the backoff entry, whose
-                # key is the full unabsorbed id set, so new evidence lands on
-                # a different key and is evaluated normally.
-                return SynthesisOutcome(
-                    "no_change", reason="already_settled", operation="no_change",
-                )
-            capped = self._cap_facts(unabsorbed)
-            source_fact_ids = sorted(str(fact["id"]) for fact in capped)
             rows = self._store.load(character)
-            topic = self._batch_topic(capped)
-            scene = self._batch_scene(capped)
-            candidates = self._candidate_rows(rows, topic, capped)
-            strategies = self._prompt_strategies(rows)
+            backoff = self._store.load_backoff(character)
+            settled = False
+            for group in self._topic_groups(unabsorbed):
+                capped = self._cap_facts(group)
+                topic = self._batch_topic(capped)
+                scene = self._batch_scene(capped)
+                relevant_rows = self._scope_rows(rows, capped)
+                candidates = self._candidate_rows(relevant_rows, topic, capped)
+                strategies = self._prompt_strategies(relevant_rows)
+                persona = self._persona_context(character, capped)
+                backoff_key = self._material_key(capped, candidates, strategies, persona)
+                entry = backoff.get(backoff_key) or {}
+                if self._no_change_settled(entry):
+                    settled = True
+                    continue
+                if (_as_int(entry.get("n"), 0) >= settings.max_synthesis_attempts
+                        and not self._dead_letter_healed(entry)):
+                    continue
+                break
+            else:
+                return SynthesisOutcome(
+                    "no_change" if settled else "skipped",
+                    reason="already_settled" if settled else "dead_letter",
+                    operation="no_change" if settled else None,
+                )
             if self._model is None:
                 self._bump_backoff(character, backoff_key)
                 return SynthesisOutcome("failed", reason="model_unavailable")
             snapshot = self._barrier.snapshot(character)
-            prompt = _build_synthesis_prompt(capped, candidates, strategies)
+            material = self._experience_context(character, capped, persona)
+            prompt = _build_synthesis_prompt(capped, candidates, strategies, material)
+            # Spend the budget on this event first; related history and persona
+            # detail can shrink without dropping a source id from the contract.
+            while len(prompt) > settings.synthesis_input_chars:
+                if material["related_experiences"]:
+                    material["related_experiences"].pop()
+                elif material["exchanges"]:
+                    last = material["exchanges"][-1]
+                    excess = len(prompt) - settings.synthesis_input_chars
+                    if len(last["text"]) > excess:
+                        last["text"] = last["text"][:-excess]
+                    else:
+                        material["exchanges"].pop()
+                elif strategies:
+                    strategies = strategies[:-1]
+                elif candidates:
+                    candidates = candidates[:-1]
+                elif material["persona"]["sections"]:
+                    key = next(reversed(material["persona"]["sections"]))
+                    material["persona"]["sections"].pop(key)
+                else:
+                    break
+                prompt = _build_synthesis_prompt(capped, candidates, strategies, material)
         try:
             raw = await self._model.invoke(
                 settings.model_tier,
@@ -910,96 +929,200 @@ class ReflectionService:
                 timeout_s=settings.synthesis_timeout_s,
                 purpose="reflection_synthesis",
             )
-        except Exception as exc:  # noqa: BLE001 - transport failure is retryable
+        except Exception as exc:  # transport failures keep this topic retryable
             self._bump_backoff(character, backoff_key)
-            return SynthesisOutcome(
-                "failed", reason=f"transport:{type(exc).__name__}",
-            )
+            return SynthesisOutcome("failed", reason=f"transport:{type(exc).__name__}")
         parsed = _parse_json_object(raw)
         if parsed is None:
             self._bump_backoff(character, backoff_key)
             return SynthesisOutcome("failed", reason="parse")
-        operation = operation_of(parsed.get("operation"))
-        raw_text = parsed.get("reflection")
-        text = (
-            raw_text.strip()[:MAX_REFLECTION_TEXT]
-            if isinstance(raw_text, str) else ""
-        )
-        if not operation:
-            # A model that names no operation but produces an understanding is
-            # asking for a plain add; one that produces nothing is reporting
-            # no_change. Neither is an error (the old code called both failed).
-            operation = "add" if text else "no_change"
-        if operation == "no_change" or not text:
-            with self._lock_for(character):
-                self._mark_no_change(character, backoff_key)
-            return SynthesisOutcome(
-                "no_change",
-                absorbed_fact_ids=(),
-                reason="nothing_new",
-                operation="no_change",
-            )
-
+        text = _bounded(parsed.get("reflection"), MAX_REFLECTION_TEXT)
+        operation = operation_of(parsed.get("operation")) or ("add" if text else "no_change")
         with self._lock_for(character):
             try:
                 self._barrier.assert_fresh(character, snapshot)
             except BarrierStaleError:
                 return SynthesisOutcome("stale", reason="barrier_stale")
+            if self._persona_context(character, capped) != persona:
+                return SynthesisOutcome("stale", reason="persona_changed")
+            current = {str(fact.get("id")): fact for fact in self._unabsorbed_facts(character)}
+            # This includes text/identity/binding changes made while generation
+            # was in flight, including corrections with no global fence bump.
+            if any(current.get(str(fact["id"])) != fact for fact in capped):
+                return SynthesisOutcome("stale", reason="sources_changed")
             rows = self._store.load(character)
-            # The model may have rewritten the batch; only facts that still
-            # exist and are not tombstoned may become sources.
-            current = {
-                str(fact.get("id")): fact for fact in self._facts.load(character)
-                if isinstance(fact, dict) and isinstance(fact.get("id"), str)
-            }
-            usable = [
-                fact_id for fact_id in source_fact_ids
-                if fact_id in current
-                and not self._barrier.blocks_row(character, current[fact_id])
-            ]
-            if len(usable) < settings.min_facts_for_reflection:
-                return SynthesisOutcome("skipped", reason="sources_deleted")
-            # Only maintenance operations retire an existing understanding.
-            # A plain add must never touch one: two different understandings
-            # under the same topic have to coexist (design section 7.2).
-            evidence_text = " ".join(
-                str(fact.get("text") or "") for fact in capped
-            )
+            relevant_rows = self._scope_rows(rows, capped)
+            current_candidates = self._candidate_rows(relevant_rows, topic, capped)
+            if self._material_key(capped, current_candidates, self._prompt_strategies(relevant_rows), persona) != backoff_key:
+                return SynthesisOutcome("stale", reason="understandings_changed")
+            if operation == "no_change" or not text and operation != "split":
+                self._mark_no_change(character, backoff_key)
+                self._mark_normal_synthesis(character)
+                return SynthesisOutcome("no_change", reason="nothing_new", operation="no_change")
+            available = {str(fact["id"]): fact for fact in capped}
+            selected = parsed.get("source_fact_ids", list(available))
+            if operation == "split" and isinstance(parsed.get("parts"), list):
+                parts = parsed["parts"]
+                if any(isinstance(part, Mapping) and "source_fact_ids" in part for part in parts):
+                    selected = []
+                    for part in parts:
+                        refs = part.get("source_fact_ids") if isinstance(part, Mapping) else None
+                        if not self._valid_fact_refs(refs, available):
+                            self._bump_backoff(character, backoff_key)
+                            return SynthesisOutcome("failed", reason="unresolved_sources")
+                        selected.extend(refs)
+            if not self._valid_fact_refs(selected, available):
+                self._bump_backoff(character, backoff_key)
+                return SynthesisOutcome("failed", reason="unresolved_sources")
+            usable = sorted(set(selected))
+            facts = [available[fact_id] for fact_id in usable]
+            # Identity and applicability are owned by the input, not generated.
+            parsed["subject"] = str(facts[0].get("subject") or "private")
+            parsed["applies_to"] = scene
+            parsed["persona_version"] = persona.get("version", "")
+            parsed["synthesis_key"] = backoff_key
+            evidence_text = " ".join(str(fact.get("text") or "") for fact in facts)
             declared_topic = _bounded(parsed.get("topic"), MAX_TOPIC_CHARS) or topic
-            target = (
-                self._resolve_target(
-                    character, rows, parsed, evidence_text, text,
-                    declared_topic, scene, candidates,
-                )
-                if operation in _MAINTENANCE_OPERATIONS else None
-            )
+            target = (self._resolve_target(character, relevant_rows, parsed, evidence_text,
+                                          text, declared_topic, scene, candidates)
+                      if operation in _MAINTENANCE_OPERATIONS else None)
             if target is None and operation in _MAINTENANCE_OPERATIONS:
-                # Nothing to maintain: the honest fallback is a plain add.
                 operation = "add"
-            topic_value = _bounded(parsed.get("topic"), MAX_TOPIC_CHARS) or topic
+            if target is not None:
+                target = _find_row(rows, str(target["id"]))
             if operation == "split":
-                outcome = self._apply_split(
-                    character, rows, parsed, usable, capped, text,
-                    topic_value, scene, backoff_key,
-                )
+                outcome = self._apply_split(character, rows, parsed, usable, facts, text,
+                                            declared_topic, scene, backoff_key)
             elif operation in ("reinforce", "refine") and target is not None:
-                outcome = self._apply_maintain(
-                    character, rows, target, operation, parsed, text,
-                    usable, capped, scene, backoff_key,
-                )
+                outcome = self._apply_maintain(character, rows, target, operation, parsed, text,
+                                               usable, facts, scene, backoff_key)
             else:
-                outcome = self._apply_new(
-                    character, rows, parsed, text, operation, usable, capped,
-                    topic_value, scene, target, backoff_key,
-                )
-            # Only a synthesis that actually produced an understanding starts
-            # the normal interval; a duplicate/skipped/failed result must not
-            # delay the next real attempt.
+                outcome = self._apply_new(character, rows, parsed, text, operation, usable, facts,
+                                          declared_topic, scene, target, backoff_key)
             if outcome.status == "completed":
                 self._mark_normal_synthesis(character)
             return outcome
 
     # -- operation helpers ----------------------------------------------
+
+    @staticmethod
+    def _valid_fact_refs(refs: Any, available: Mapping[str, Any]) -> bool:
+        return (isinstance(refs, list) and bool(refs)
+                and all(isinstance(ref, str) and ref in available for ref in refs))
+
+    def _topic_groups(self, facts: Sequence[Mapping[str, Any]]) -> list[list[dict[str, Any]]]:
+        """Identity first, then explicit topic/episode links and term overlap."""
+        groups: list[list[dict[str, Any]]] = []
+        for fact in sorted(facts, key=lambda row: (-_importance_of(row), str(row.get("created_at") or ""), str(row["id"]))):
+            for group in groups:
+                seed = group[0]
+                if (str(seed.get("subject") or "private") != str(fact.get("subject") or "private")
+                        or scope_key(seed.get("applies_to")) != scope_key(fact.get("applies_to"))):
+                    continue
+                same_topic = bool(fact.get("topic_key")) and fact.get("topic_key") == seed.get("topic_key")
+                same_episode = bool(fact.get("episode_id")) and fact.get("episode_id") == seed.get("episode_id")
+                same_exchange = bool(_row_source_keys(seed) & _row_source_keys(fact))
+                overlap = _semantic_overlap(seed.get("text"), fact.get("text"))
+                if same_topic or overlap >= (0.05 if same_episode or same_exchange else 0.3):
+                    group.append(dict(fact))
+                    break
+            else:
+                groups.append([dict(fact)])
+        return groups
+
+    def _scope_rows(self, rows: Sequence[Mapping[str, Any]], facts: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        subject = str(facts[0].get("subject") or "private")
+        scene = self._batch_scene(facts)
+        return [row for row in rows if row_matches_subject(row, subject)
+                and not reflection_invalidated(row) and not row.get("needs_rebuild")
+                and _entry_applies_to_scene(row, scene)]
+
+    def _persona_context(self, character: str, facts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        snapshot = self._persona_reader(character) if self._persona_reader is not None else None
+        if snapshot is None or not snapshot.available:
+            return {"character": character, "version": "", "sections": {}}
+        subject = str(facts[0].get("subject") or "private")
+        scene = self._batch_scene(facts)
+        sections = {key: text[:4000] for key, text in snapshot.projection.items()
+                    if not text.startswith(EXAMPLES_BANNER)
+                    and row_matches_subject(snapshot.section_scopes.get(key, {}), subject)
+                    and _entry_applies_to_scene(snapshot.section_scopes.get(key, {}), scene)}
+        remaining = self._settings.synthesis_input_chars // 4
+        for key in list(sections):
+            sections[key] = sections[key][:remaining]
+            remaining -= len(sections[key])
+            if not sections[key]:
+                del sections[key]
+        return {"character": character, "version": snapshot.version, "sections": sections}
+
+    @staticmethod
+    def _material_key(facts: Sequence[Mapping[str, Any]], candidates: Sequence[Mapping[str, Any]],
+                      strategies: Sequence[Mapping[str, Any]], persona: Mapping[str, Any]) -> str:
+        fact_fields = ("id", "text", "entity", "source", "evidence_kind", "source_event_keys", "source_bindings",
+                       "subject", "applies_to", "created_at", "last_confirmed_at", "episode_id", "topic_key")
+        row_fields = ("id", "text", "status", "claim", "situation", "source_fact_ids", "updated_at", "applies_to")
+        seed = [[{key: fact.get(key) for key in fact_fields} for fact in facts],
+                [{key: row.get(key) for key in row_fields} for row in candidates],
+                [{key: row.get(key) for key in row_fields} for row in strategies], persona]
+        return "fg02:" + hashlib.sha256(json.dumps(seed, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:32]
+
+    def _experience_context(self, character: str, facts: Sequence[Mapping[str, Any]],
+                            persona: Mapping[str, Any]) -> dict[str, Any]:
+        subject = str(facts[0].get("subject") or "private")
+        scene = self._batch_scene(facts)
+        current_ids = {str(fact["id"]) for fact in facts}
+        related = [row for row in self._facts.load(character)
+                   if str(row.get("id")) not in current_ids and row_matches_subject(row, subject)
+                   and _entry_applies_to_scene(row, scene) and not fact_invalidated(row)
+                   and not self._barrier.blocks_row(character, row)
+                   and max((_semantic_overlap(row.get("text"), fact.get("text")) for fact in facts), default=0) >= 0.3]
+        related = self._cap_facts(related)[:5]
+        corrected_keys = {key for row in self._facts.load(character)
+                          if fact_invalidated(row) and row_matches_subject(row, subject)
+                          and _entry_applies_to_scene(row, scene) for key in _row_source_keys(row)}
+        keys = sorted({key for row in facts for key in _row_source_keys(row)})
+        old_keys = sorted({key for row in related for key in _row_source_keys(row)} - set(keys))
+        exchanges = []
+        if self._timeindex_factory is not None:
+            with self._timeindex_factory(character) as index:
+                for source_keys in (keys, old_keys):
+                    exchanges.extend(json.loads(row["message"]) for row in index.original_for_sources(source_keys))
+        if self._recent is not None:
+            indexed_keys = {key for message in exchanges for key in message_source_keys(message)}
+            exchanges.extend(row for row in self._recent.load(character)
+                             if message_source_keys(row) & set(keys + old_keys)
+                             and not message_source_keys(row) & indexed_keys)
+        visible = []
+        seen = set()
+        budget = self._settings.synthesis_input_chars // 2
+        # Raw messages are already numbered at ingest. Legacy rows get their
+        # fixed position within each source event before filtering.
+        positions: dict[str, int] = {}
+        for message in exchanges:
+            meta = metadata_of(message)
+            source = str(meta.get("source_key") or next(iter(sorted(message_source_keys(message))), ""))
+            position = positions.get(source, 0)
+            positions[source] = position + 1
+            if "message_position" not in meta:
+                message = dict(message, metadata=dict(meta, message_position=position,
+                                                     message_ref=f"{source}:m{position}"))
+            numbered = number_messages([message])[0]
+            line = message_material(numbered)
+            if (line["message_ref"] in seen or message_role(message) not in ("user", "assistant", "tool")
+                    or not row_matches_subject(meta, subject) or not _entry_applies_to_scene(meta, scene)
+                    or not is_extractable(meta.get("content_class"))
+                    or message_source_keys(message) & corrected_keys
+                    or self._barrier.blocks_message(character, message)):
+                continue
+            seen.add(line["message_ref"])
+            size = len(line["text"])
+            if budget <= 0:
+                break
+            line["text"] = line["text"][:budget]
+            visible.append(line)
+            budget -= min(size, budget)
+        return {"persona": dict(persona, sections=dict(persona["sections"])), "subject": subject, "scene": scene,
+                "exchanges": visible, "related_experiences": related}
 
     @staticmethod
     def _batch_topic(facts: Sequence[Mapping[str, Any]]) -> str:
@@ -1043,7 +1166,7 @@ class ReflectionService:
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            if str(row.get("status") or "") not in REFLECTION_ACTIVE_STATUSES:
+            if str(row.get("status") or "") not in _TARGET_STATUSES:
                 continue
             if row.get("needs_rebuild"):
                 continue
@@ -1194,8 +1317,13 @@ class ReflectionService:
             parsed.get("applies_to"),
         )
         reflection_id = reflection_id_from_topic(topic, scene_map, text)
+        if parsed.get("subject") not in (None, "", "private"):
+            reflection_id += "_" + hashlib.sha256(parsed["subject"].encode()).hexdigest()[:8]
         existing = _find_row(rows, reflection_id)
         if existing is not None:
+            if parsed.get("synthesis_key") not in (existing.get("synthesis_keys") or ()):
+                return self._apply_maintain(character, rows, existing, "reinforce", parsed, text,
+                                            usable, facts, scene, backoff_key)
             absorbed = self._mark_absorbed(character, usable)
             self._clear_backoff(character, backoff_key)
             growth_ids = (
@@ -1262,6 +1390,11 @@ class ReflectionService:
     ) -> SynthesisOutcome:
         """reinforce (same understanding, more support) or refine (narrow it)."""
         target_id = str(target.get("id"))
+        if backoff_key in (target.get("synthesis_keys") or ()):
+            absorbed = self._mark_absorbed(character, usable)
+            self._clear_backoff(character, backoff_key)
+            return SynthesisOutcome("duplicate", reflection_ids=(target_id,),
+                                    absorbed_fact_ids=tuple(absorbed), operation=operation)
         now_iso = _now_iso(self._clock.now())
         sources = [
             str(item) for item in target.get("source_fact_ids") or ()
@@ -1290,22 +1423,18 @@ class ReflectionService:
             new_topic = _bounded(parsed.get("topic"), MAX_TOPIC_CHARS)
             if new_topic:
                 target["topic"] = new_topic
-        if target.get("memory_kind") in MEMORY_KINDS:
-            # Reinforce/refine advances support by *independent experience*, the
-            # same unit the creation path and the deletion recompute use. Adding
-            # one key per message would let a single conversation clear the
-            # two-experience gate.
-            merged = merge_basis(
-                support_basis_from_row(target),
-                support_basis_from_facts(list(facts)),
-            )
-            target.update(summarize_basis(merged))
-            if (
-                str(target.get("status") or "") in ("pending", "narrowed")
-                and self._growth_promotion_ready(target)
-            ):
-                target["status"] = "confirmed"
-                target["confirmed_at"] = now_iso
+        target["synthesis_keys"] = (list(target.get("synthesis_keys") or ()) + [backoff_key])[-32:]
+        target["persona_version"] = parsed.get("persona_version", "")
+        before_support = summarize_basis(support_basis_from_row(target))["support_count"]
+        merged = merge_basis(support_basis_from_row(target), support_basis_from_facts(list(facts)))
+        target.update(summarize_basis(merged))
+        target["source_event_keys"] = sorted(set(target.get("source_event_keys") or ())
+                                             | {key for fact in facts for key in _row_source_keys(fact)})
+        if (target.get("memory_kind") in MEMORY_KINDS
+                and str(target.get("status") or "") in ("pending", "narrowed")
+                and self._growth_promotion_ready(target)):
+            target["status"] = "confirmed"
+            target["confirmed_at"] = now_iso
         target["updated_at"] = now_iso
         self._store.save(character, rows)
         self._record_evidence(
@@ -1313,7 +1442,7 @@ class ReflectionService:
             target_id,
             {
                 "reinforcement": _as_float(target.get("reinforcement"), 0.0)
-                + REINFORCE_DELTA,
+                + (REINFORCE_DELTA if target["support_count"] > before_support else 0.0),
                 "rein_last_signal_at": now_iso,
             },
         )
@@ -1349,6 +1478,7 @@ class ReflectionService:
         experience once per part (design section 7.4).
         """
         parts: list[tuple[str, dict[str, str]]] = []
+        explicit_sources: list[list[str] | None] = []
         raw_parts = parsed.get("parts")
         if isinstance(raw_parts, (list, tuple)):
             for item in raw_parts:
@@ -1360,6 +1490,7 @@ class ReflectionService:
                     part_scene = dict(scene)
                 if part_text:
                     parts.append((part_text, part_scene))
+                    explicit_sources.append(item.get("source_fact_ids") if isinstance(item, Mapping) else None)
         if len(parts) < 2:
             return SynthesisOutcome(
                 "skipped", reason="split_needs_two_parts", operation="split",
@@ -1369,7 +1500,9 @@ class ReflectionService:
             if isinstance(fact.get("id"), str)
         }
         assigned: list[list[str]] = [[] for _ in parts]
-        for fact_id in usable:
+        if all(refs is not None for refs in explicit_sources):
+            assigned = [list(dict.fromkeys(refs)) for refs in explicit_sources]
+        for fact_id in (() if all(refs is not None for refs in explicit_sources) else usable):
             fact = fact_by_id.get(fact_id)
             fact_text = str((fact or {}).get("text") or "")
             best_index = 0
@@ -1388,13 +1521,25 @@ class ReflectionService:
                 # An unsupported part is skipped, never given a borrowed set.
                 continue
             part_id = reflection_id_from_topic(topic, part_scene, part_text)
-            if _find_row(rows, part_id) is not None:
+            if parsed.get("subject") not in (None, "", "private"):
+                part_id += "_" + hashlib.sha256(parsed["subject"].encode()).hexdigest()[:8]
+            existing = _find_row(rows, part_id)
+            if existing is not None:
+                if backoff_key in (existing.get("synthesis_keys") or ()):
+                    created.append(part_id)
+                    absorbed.extend(part_sources)
                 continue
             part_facts = [
                 fact_by_id[item] for item in part_sources if item in fact_by_id
             ]
+            part_parsed = dict(parsed, applies_to=part_scene)
+            part_data = raw_parts[index]
+            if isinstance(part_data, Mapping):
+                for key in ("entity", "claim", "situation", "memory_kind"):
+                    if key in part_data:
+                        part_parsed[key] = part_data[key]
             row = self._new_reflection_row(
-                part_id, part_sources, part_facts, parsed, part_text,
+                part_id, part_sources, part_facts, part_parsed, part_text,
                 topic=topic, scene=part_scene, operation="split",
             )
             try:
@@ -1411,6 +1556,9 @@ class ReflectionService:
         self._store.save(character, rows)
         marked = self._mark_absorbed(character, sorted(set(absorbed)))
         self._clear_backoff(character, backoff_key)
+        target = _find_row(rows, str(parsed.get("target_reflection_id") or ""))
+        if target is not None and str(target["id"]) not in created:
+            self._retire_target(character, target, "split", {"id": created[0]})
         return SynthesisOutcome(
             "completed",
             reflection_ids=tuple(created),
@@ -1550,6 +1698,7 @@ class ReflectionService:
             "at": None,
             "nc": key,
             "nc_at": _now_iso(self._clock.now()),
+            "result": "no_change",
         }
         self._store.save_backoff(character, doc)
 
@@ -1563,6 +1712,8 @@ class ReflectionService:
             if not isinstance(fact_id, str) or not fact_id:
                 continue
             if fact.get("absorbed"):
+                continue
+            if fact_invalidated(fact):
                 continue
             if self._barrier.blocks_row(character, fact):
                 continue
@@ -1579,7 +1730,15 @@ class ReflectionService:
                 str(fact.get("created_at") or ""),
             ),
         )
-        return [dict(fact) for fact in ordered[: self._settings.synthesis_facts_max]]
+        selected = []
+        used = 0
+        for fact in ordered[: self._settings.synthesis_facts_max]:
+            size = len(str(fact.get("text") or "")[:600]) + len(str(fact.get("message_refs") or [])[:500]) + 200
+            if selected and used + size > self._settings.synthesis_input_chars // 2:
+                break
+            selected.append(dict(fact))
+            used += size
+        return selected
 
     def _new_reflection_row(
         self,
@@ -1663,6 +1822,10 @@ class ReflectionService:
             "superseded_reason": None,
             "supersedes": None,
             "previous_texts": [],
+            "persona_version": parsed.get("persona_version", ""),
+            "synthesis_keys": [parsed["synthesis_key"]] if parsed.get("synthesis_key") else [],
+            "source_event_keys": sorted({key for fact in facts for key in _row_source_keys(fact)}),
+            **summarize_basis(support_basis_from_facts(facts)),
         }
         for key in (
             "speaker_id", "speaker_trust", "speaker_label",
@@ -1731,6 +1894,7 @@ class ReflectionService:
                 isinstance(item, dict)
                 and item.get("memory_kind") in MEMORY_KINDS
                 and item.get("growth_key") == key
+                and row_matches_subject(item, row.get("subject"))
                 and str(item.get("status") or "") not in GROWTH_TERMINAL_STATUSES
             ):
                 target = item
@@ -2822,6 +2986,10 @@ class ReflectionService:
 
     def _clear_backoff(self, character: str, key: str) -> None:
         doc = self._store.load_backoff(character)
+        if key.startswith("fg02:"):
+            doc[key] = {"n": 0, "at": None, "result": "completed", "completed_at": _now_iso(self._clock.now())}
+            self._store.save_backoff(character, doc)
+            return
         if key in doc:
             doc.pop(key, None)
             self._store.save_backoff(character, doc)
@@ -2851,6 +3019,7 @@ class ReflectionService:
             marked.append(fact_id)
             if fact.get("absorbed") is not True:
                 fact["absorbed"] = True
+                fact["reflection_source_keys"] = sorted(_row_source_keys(fact))
                 changed = True
         if changed:
             self._facts.save(character, facts)
@@ -3464,43 +3633,43 @@ def _build_synthesis_prompt(
     facts: Sequence[Mapping[str, Any]],
     old_rows: Sequence[Mapping[str, Any]] = (),
     strategies: Sequence[Mapping[str, Any]] = (),
+    material: Mapping[str, Any] | None = None,
 ) -> str:
-    """Synthesis prompt: new evidence + existing understandings + strategies.
-
-    The old prompt listed facts only and ended with "produce the most
-    conservative understanding anyway", so a model could never say "nothing
-    new here" and could never maintain an existing row. This one asks for a
-    single local operation against the rows it was shown (design section 7.2).
-    """
+    """First-person reflection over new facts and existing understandings."""
     lines = [
-        f"- {str(fact.get('text') or '').strip()} "
-        f"(importance: {_importance_of(fact)})"
+        f"[{fact.get('id')}] {str(fact.get('text') or '').strip()[:600]} "
+        f"(importance: {_importance_of(fact)}, entity={fact.get('entity')}, source={fact.get('source')}, "
+        f"time={fact.get('created_at')}, message_refs={(fact.get('message_refs') or [])[:4]})"
         for fact in facts
         if str(fact.get("text") or "").strip()
     ]
     body = "\n".join(lines)
     old_block = _render_old_rows(old_rows)
     strategy_block = _render_strategies(strategies)
-    old_section = "\n".join(old_block) if old_block else "(无，本主题还没有已有认识)"
+    old_section = "\n".join(old_block) if old_block else "(这个主题等待我形成认识)"
     strategy_section = (
         "\n".join(strategy_block) if strategy_block
-        else "(无，还没有已采用的策略)"
+        else "(当前采用的相处方式为空)"
     )
     return (
-        "你是长期记忆反思器。你维护的是已有的认识，而不是每批事实都产出一句新结论。\n"
-        "先读下面【已有认识】和【已采用策略】，再看【新事实】，"
-        "判断这批新事实该怎么改动已有认识，只选一个操作：\n"
-        "- add：确实出现一个全新的、有用的认识（与已有认识不重复）；\n"
-        "- reinforce：同一认识新增了独立支持，措辞不需要改；\n"
-        "- refine：需要补条件或收窄适用范围；\n"
-        "- supersede：旧认识已经过时，被这批事实取代；\n"
-        "- contradict：这批事实与旧认识明确相反；\n"
-        "- split：一条过宽的认识需要按场景拆开（用 parts 给出至少两条）；\n"
-        "- no_change：这批事实没有带来足够的新信息。\n"
-        "重要：no_change 是正常结果。没有新的稳定认识时必须选 no_change，"
-        "不要为了填满字段而硬造一条最保守的结论；也不要重复已有认识。\n"
-        "只输出一个 JSON 对象：{\"operation\": \"add|reinforce|refine|supersede|"
-        "contradict|split|no_change\", \"reflection\": \"一句独立陈述，no_change 时为 null\", "
+        FIRST_PERSON_VOICE
+        + "我带着【现在的我】回看【这段经历】与【相关旧经历】，记录中的角色与消息引用保留原说话者身份。\n"
+        + "我结合【已有认识】、【已采用策略】和【新事实】，回看这些内容对我的意义。"
+        "我留意自己更了解了谁、产生了什么兴趣、哪些判断得到补充，以及哪些相处感受逐渐加深。"
+        "这些方向按本次材料自然选择。\n"
+        "我选择值得留下的理解，让新的认识延续过去的经历，并选择一个操作：\n"
+        "- add：我形成了一个新的、有具体意义的认识；\n"
+        "- reinforce：我获得了独立支持，保留原有认识的表达；\n"
+        "- refine：我补充条件，让原有认识更准确；\n"
+        "- supersede：我用新的理解替代已经过时的认识；\n"
+        "- contradict：我发现新事实与旧判断相反，修正原有理解；\n"
+        "- split：我按情境分别理解原来的认识，用 parts 写出至少两条；\n"
+        "- no_change：已有认识足以涵盖本次材料，我保留当前理解。\n"
+        "我用几句简短、连贯的话写清具体内容与个人理解之间的联系。"
+        "未来的想法写成当前的期待或尝试方向，已经发生的事情按材料记录。"
+        "reflection、claim 和 parts 中的正文都采用我的第一人称，situation 按实际适用情境填写。\n"
+        "本次输出为 JSON 对象：{\"operation\": \"add|reinforce|refine|supersede|"
+        "contradict|split|no_change\", \"reflection\": \"我的理解，no_change 时为 null\", "
         "\"target_reflection_id\": \"要改动的已有认识 id，add 时为 null\", "
         "\"topic\": \"这条认识的主题，简短名词\", "
         "\"entity\": \"master|neko|relationship\", "
@@ -3509,9 +3678,11 @@ def _build_synthesis_prompt(
         "\"session_id\": null, \"scope\": null}, "
         "\"memory_kind\": null|habit|interest|experience|relationship, "
         "\"claim\": null, \"situation\": null, "
-        "\"parts\": null|[{\"reflection\": \"...\", \"applies_to\": null}]}。\n"
-        "认识要写成条件化的策略：触发条件 + 推荐做法 + 例外，"
-        "不要写成空泛的性格评价。不要复述原文，不要编造。只输出 JSON。\n\n"
+        "\"source_fact_ids\": [实际采用的新事实id], "
+        "\"parts\": null|[{\"reflection\": \"...\", \"applies_to\": null, \"source_fact_ids\": [本条采用的事实id]}]}。\n"
+        "我选择实际支持这条理解的事实 ID。split 中每条理解分别选择自己的来源。"
+        "原始轮次和旧经历帮助理解本次主题，认识的支持依据使用本次提供的新事实。\n\n"
+        f"【现在的我、这段经历、相关旧经历】\n{json.dumps(material or {}, ensure_ascii=False)}\n\n"
         f"【已有认识】\n{old_section}\n\n"
         f"【已采用策略】\n{strategy_section}\n\n"
         f"【新事实】\n{body}"
