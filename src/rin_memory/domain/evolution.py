@@ -32,6 +32,7 @@ from datetime import timedelta
 from typing import Any, Mapping, Sequence
 
 from ..ports import Clock, ModelInvoker, StorageRoots, WritePermit
+from ..invalidation import is_friend_subject
 from ..persistence.evolution import (
     STATUS_PROPOSED,
     STATUS_WITHDRAWN,
@@ -518,7 +519,8 @@ class EvolutionService:
                 raw = [raw]
         if not isinstance(raw, (list, tuple)):
             raw = []
-        rows = [copy.deepcopy(dict(row)) for row in raw if isinstance(row, Mapping)]
+        rows = [copy.deepcopy(dict(row)) for row in raw if isinstance(row, Mapping)
+                and not is_friend_subject(_row_subject(row))]
         rows = rows[: self._settings.max_evidence]
         if not rows:
             return [], REASON_INSUFFICIENT_EVIDENCE, _validation(

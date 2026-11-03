@@ -27,7 +27,7 @@ from ..classification import (
 from ..contracts import CorrectionRequest, MemoryEvent, Scene, Scope
 from ..domain.barrier import DeletionBarrier, message_source_keys, message_text
 from ..event_sources import parse_source_key
-from ..invalidation import row_matches_subject, scene_applies
+from ..invalidation import is_friend_subject, row_matches_subject, scene_applies
 from ..persistence.facts_view import FactsView
 from ..persistence.gates import SuppressionGate
 from ..persistence.outbox import OutboxStore
@@ -656,7 +656,7 @@ class ExtractionService:
         } - set(all_keys))
         identity = self._identity_prompt(character, metadata)
         prompt = identity + _build_batch_prompt(utterances, reference)
-        if self._conversation_state is not None:
+        if self._conversation_state is not None and not is_friend_subject(metadata.get("subject")):
             state = self._conversation_state.snapshot(character, metadata)
             prompt += (
                 "\n\n我同时整理正在关注的事项，以第一人称写 text、next_step 和 why。输出采用 JSON 对象："
@@ -678,7 +678,7 @@ class ExtractionService:
                 )
                 + "\n当前同范围事项：" + json.dumps(list(state.items)[:20], ensure_ascii=False)
             )
-        if self._interests is not None:
+        if self._interests is not None and not is_friend_subject(metadata.get("subject")):
             # Only ask for what can be stored: an unwired layer must not add
             # tokens to every extraction call.
             prompt += SIGNAL_PROMPT
@@ -719,6 +719,8 @@ class ExtractionService:
             self._settle_op(character, op_ids, outcome)
             return outcome
         raw_candidates, raw_updates, raw_signals = parsed
+        if is_friend_subject(metadata.get("subject")):
+            raw_updates, raw_signals = [], []
         # An answer without attributable sources is a failed extraction, not
         # an empty result. Keep the entire batch queued before writing any
         # facts or state so a later retry can repair the model's citations.
@@ -746,7 +748,7 @@ class ExtractionService:
             window_keys=sorted(all_keys),
         )
         state_applied = 0
-        if self._conversation_state is not None and raw_updates:
+        if self._conversation_state is not None and raw_updates and not is_friend_subject(metadata.get("subject")):
             entries = _bind_state_updates(raw_updates, utterances)
             if entries:
                 state_applied = self._conversation_state.apply_sequence(
@@ -778,7 +780,7 @@ class ExtractionService:
         facts are deduplicated on retry. An invalid signal citation is rejected
         by the interest service instead of being stored without a source.
         """
-        if self._interests is None or not signals:
+        if self._interests is None or not signals or all(is_friend_subject(row.get("metadata", {}).get("subject")) for row in utterances):
             return 0
         return int(self._interests.record(character, signals, utterances) or 0)
 
@@ -871,7 +873,7 @@ class ExtractionService:
             } - set(evidence_keys))
             identity = self._identity_prompt(character, metadata)
             prompt = identity + _build_prompt(kept, context)
-            if self._conversation_state is not None:
+            if self._conversation_state is not None and not is_friend_subject(metadata.get("subject")):
                 state = self._conversation_state.snapshot(character, metadata)
                 prompt += (
                     "\n\n我同时整理正在关注的事项，以第一人称写 text、next_step 和 why。输出采用 JSON 对象："
@@ -888,7 +890,7 @@ class ExtractionService:
                     "\n本轮原始时间：" + (occurred_at or self._clock.now()).isoformat()
                     + "\n当前同范围事项：" + json.dumps(list(state.items)[:20], ensure_ascii=False)
                 )
-            if self._interests is not None:
+            if self._interests is not None and not is_friend_subject(metadata.get("subject")):
                 # Only ask for what can be stored (see the batched path).
                 prompt += SIGNAL_PROMPT
             try:
@@ -925,7 +927,7 @@ class ExtractionService:
             context_refs=context_keys, episode_id=episode_id,
             occurred_at=occurred_at,
         )
-        if self._conversation_state is not None:
+        if self._conversation_state is not None and not is_friend_subject(metadata.get("subject")):
             try:
                 self._conversation_state.apply(
                     character, state_updates, metadata=metadata,
@@ -952,6 +954,8 @@ class ExtractionService:
 
 
     def _identity_prompt(self, character: str, metadata: Mapping[str, Any]) -> str:
+        if is_friend_subject(metadata.get("subject")):
+            return "这次对话的对象是 QQ 朋友。我只整理这位朋友和本次互动的事实，按原话记录称呼与关系。\n\n"
         snapshot = self._persona_reader(character) if self._persona_reader else None
         if snapshot is None or not snapshot.available:
             return ""

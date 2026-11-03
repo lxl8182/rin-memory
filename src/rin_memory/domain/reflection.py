@@ -76,6 +76,7 @@ from ..domain.barrier import DeletionBarrier, episode_ids_of
 from ..errors import BarrierStaleError, ContentBlockedError
 from ..invalidation import (
     fact_invalidated,
+    is_friend_subject,
     normalize_text,
     reflection_invalidated,
     row_matches_subject,
@@ -1707,6 +1708,8 @@ class ReflectionService:
         out: list[dict[str, Any]] = []
         for fact in facts:
             if not isinstance(fact, dict):
+                continue
+            if is_friend_subject(fact.get("subject")):
                 continue
             fact_id = fact.get("id")
             if not isinstance(fact_id, str) or not fact_id:

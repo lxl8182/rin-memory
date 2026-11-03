@@ -36,7 +36,7 @@ from functools import lru_cache
 from typing import Any, Mapping, Sequence
 
 from ..contracts import MemoryBlock
-from ..invalidation import filter_valid_entries, normalize_text, subject_key
+from ..invalidation import filter_valid_entries, is_friend_subject, normalize_text, subject_key
 from ..ports import Clock, EmbeddingProvider, TokenCounter
 
 # -- settings ---------------------------------------------------------------
@@ -1724,7 +1724,7 @@ class RecallService:
                     corrections_block=self._corrections_block(
                         name, subject, scene, language,
                     ),
-                    growth_block=self._growth_block(name, scene, language),
+                    growth_block=self._growth_block(name, scene, language, subject),
                     query_meta=timed.get("query_meta") or {},
                     candidates_total=int(timed.get("candidates_total") or 0),
                     error_code=timed.get("error_code"),
@@ -1790,7 +1790,7 @@ class RecallService:
                     used += cost
                 items = kept
             corrections_block = self._corrections_block(name, subject, scene, language)
-            growth_block = self._growth_block(name, scene, language)
+            growth_block = self._growth_block(name, scene, language, subject)
             return self._result(
                 "matched" if items else "miss",
                 start,
@@ -1982,7 +1982,7 @@ class RecallService:
             "recent_interests": [], "avoid_topics": [],
         }
         service = self._interests
-        if service is None:
+        if service is None or is_friend_subject(subject):
             return empty
         name = str(character or "").strip()
         if not name:
@@ -2010,7 +2010,7 @@ class RecallService:
         """
         empty = {"status": "not_continuation", "thread": None,
                  "candidates": [], "clarify_basis": []}
-        if self._working_summary is None:
+        if self._working_summary is None or is_friend_subject(subject):
             return empty
         text = str(query or "")
         if not text.strip():
@@ -2044,7 +2044,7 @@ class RecallService:
             "thread_episode": "",
         }
         name = str(character or "").strip()
-        if not name:
+        if not name or is_friend_subject(subject):
             return extras
         subject_key = str(subject or "private").strip() or "private"
         snapshot = None
@@ -2193,7 +2193,7 @@ class RecallService:
             corrections_block = self._corrections_block(
                 name, subject, scene, language,
             )
-            growth_block = self._growth_block(name, scene, language)
+            growth_block = self._growth_block(name, scene, language, subject)
             bm25_pool = self._candidate_rows(pool)
             embedding_pool = self._embedding_rows(pool)
             if not bm25_pool:
@@ -2446,14 +2446,15 @@ class RecallService:
             and not row.get("arbitration_archived_at")
         ]
         reflections: list[dict[str, Any]] = []
-        if self._reflections is not None:
+        facts_only = bool(subjects) and all(is_friend_subject(subject) for subject in subjects)
+        if self._reflections is not None and not facts_only:
             reflections = [
                 row for row in (self._reflections.load(character) or ())
                 if isinstance(row, Mapping)
                 and str(row.get("status") or "") not in REFLECTION_TERMINAL_STATUSES
             ]
         persona_rows: list[dict[str, Any]] = []
-        if self._persona is not None:
+        if self._persona is not None and not facts_only:
             persona_rows = self._persona_left_out(
                 character, subjects=subjects, scene=scene,
             )
@@ -2779,9 +2780,9 @@ class RecallService:
             return dict(_EMPTY_CORRECTIONS)
 
     def _growth_block(
-        self, character: str, scene: Any, language: str,
+        self, character: str, scene: Any, language: str, subject: Any = None,
     ) -> dict[str, Any]:
-        if self._reflections is None:
+        if self._reflections is None or is_friend_subject(subject):
             return dict(_EMPTY_GROWTH)
         render = getattr(self._reflections, "growth_block", None)
         if not callable(render):

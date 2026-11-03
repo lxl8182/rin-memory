@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rin_memory.adapters.model_http import ModelCallError
+from rin_memory.contracts import DeletionRequest, DeletionTarget, Scene, Scope
 from rin_memory.service.management import ManagementApi
 from rin_memory.service.memory_service import MemoryService, ServiceSettings
 from rin_memory.service.server import MemoryApi, build_server
@@ -112,6 +113,75 @@ class ServiceCloseoutTests(unittest.TestCase):
                 "source_key": "host:test:private:" + request_id,
                 "messages": [{"role": "user", "content": "我喜欢乌龙茶"}],
                 "session_id": "session", **kwargs}
+
+    def test_friend_memory_is_scoped_factual_and_stays_deleted_after_restart(self):
+        self.initialize()
+        friend = {"subject": "qq-friend:42", "session_id": "qq-friend-old", "scene": "plugin:game_test"}
+        plugin = {"client": "plugin", "token": "test-plugin"}
+        self.assertEqual(self.request("/v1/context", friend, **plugin)[0], 403)
+        self.service.settings.clients["plugin"]["subjects"].append("qq-friend:42")
+        self.assertEqual(self.request("/v1/context", dict(friend, subject="qq-friend:43"), **plugin)[0], 403)
+        context = self.ok("/v1/context", dict(friend, text="红茶"), **plugin)
+        self.assertEqual(context["persona"], "")
+        self.assertEqual(context["persona_version"], "")
+        self.assertEqual(context["memory_awareness"], {})
+        self.assertEqual(context["projection"], {})
+        self.assertTrue(self.ok("/v1/context", {"text": "红茶"})["persona"])
+
+        calls = []
+        async def extract(tier, messages, **kwargs):
+            calls.append(messages[0]["content"])
+            return json.dumps({"facts": [{"text": "用户喜欢红茶", "importance": 8,
+                "utterance_indices": [1]}], "state_updates": [{"kind": "thread_open", "utterance_indices": [99]}],
+                "signals": [{"topic": "红茶", "utterance_indices": [1]}]}, ensure_ascii=False)
+        core = self.service.core
+        core.extraction._model.invoke = extract
+        core.extraction._settings = replace(core.extraction._settings, batch_max_turns=1, batch_idle_seconds=0)
+        self.ok("/v1/context/reserve", dict(friend, request_id="friend-one",
+            context_receipt_id=context["context_receipt_id"]), **plugin)
+        body = self.body("friend-one", **friend,
+            source_key="plugin:game_test:test:qq-friend_42:old:one",
+            context_receipt_id=context["context_receipt_id"],
+            messages=[{"role": "user", "content": "我喜欢红茶"}], reply="记住啦。")
+        self.ok("/v1/turns", body, **plugin)
+        self.ok("/v1/receipts", dict(friend, request_id="friend-one", receipt_id="friend-used", kind="used"), **plugin)
+        outcomes = asyncio.run(core.extraction.process_outbox("test"))
+        self.assertTrue(outcomes)
+        self.assertTrue(all(row.status == "completed" for row in outcomes), outcomes)
+        facts = core.facts.load("test")
+        self.assertEqual(len(facts), 1)
+        self.assertEqual(facts[0]["subject"], "qq-friend:42")
+        self.assertNotIn("state_updates", calls[0])
+        self.assertNotIn("兴趣信号", calls[0])
+        fact_id = facts[0]["id"]
+
+        async def recalled(subject):
+            result = await core.recall.recall_memory("test", "用户喜欢红茶", subject=subject,
+                scene=Scene(plugin_id="game_test"))
+            return {row["id"] for row in result.get("items") or ()}
+        self.assertIn(fact_id, asyncio.run(recalled("qq-friend:42")))
+        self.assertNotIn(fact_id, asyncio.run(recalled("qq-friend:43")))
+        self.assertNotIn(fact_id, asyncio.run(recalled("private")))
+        before = len(calls)
+        asyncio.run(core.reflection_service.synthesize("test"))
+        self.assertEqual(len(calls), before, "friend facts never enter global reflection")
+        self.assertEqual(core.reflections.load("test"), [])
+        new = dict(friend, session_id="qq-friend-new")
+        self.ok("/v1/context", dict(new, text="红茶"), **plugin)
+        # Deletion uses the friend's subject; the friend keeps a zero-tool session.
+        asyncio.run(core.deletion_service.forget(DeletionRequest(
+            scope=Scope("test", "qq-friend:42"), targets=(DeletionTarget("fact", fact_id),),
+            reason="user_request",
+        )))
+        self.assertEqual(asyncio.run(recalled("qq-friend:42")), set())
+        self.close()
+        self.start()
+        self.service.settings.clients["plugin"]["subjects"].append("qq-friend:42")
+        after = self.ok("/v1/context", dict(new, text="红茶"), **plugin)
+        self.assertNotIn(fact_id, after["context"].get("memory_ids") or [])
+        code, error = self.request("/v1/turns", body, **plugin)
+        self.assertEqual(code, 410)
+        self.assertEqual(error["code"], "deleted")
 
     def test_tunnel_origin_can_delete_a_fact(self):
         self.service.core.facts.save("test", [{

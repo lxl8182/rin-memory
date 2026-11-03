@@ -31,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 
 from ..ports import Clock, StorageRoots, WritePermit
+from ..invalidation import is_friend_subject
 from ..persistence.clock import SystemClock
 from ..persistence.evolution_runs import (
     RUN_ACCEPTED,
@@ -631,6 +632,8 @@ class EvolutionScheduler:
             if not isinstance(item, Mapping):
                 continue
             row = copy.deepcopy(dict(item))
+            if is_friend_subject(row.get("subject")):
+                continue
             if row.get("absorbed_into") or row.get("absorbed_at"):
                 continue
             status = str(row.get("status") or "").strip().lower()

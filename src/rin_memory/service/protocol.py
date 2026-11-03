@@ -14,7 +14,7 @@ from ..contracts import Scene, Scope
 from ..domain.persona_teaching import EXPRESSION_SECTION_ID
 from ..domain.memory_awareness import memory_awareness
 from ..event_sources import parse_source_key, sanitize_component
-from ..invalidation import row_matches_subject, scene_applies
+from ..invalidation import is_friend_subject, row_matches_subject, scene_applies
 from ..persistence.records import event_from_snapshot, fingerprint
 from ..persistence.consumer_receipts import ConsumerReceiptStore, RECEIPT_EVENT
 from ..persistence.atomic import FileSystemAtomicStore
@@ -134,7 +134,8 @@ class ServiceProtocol:
         basis = basis if basis is not None else self.basis()
         card = self.core.persona_card_service.get(self.character)
         published = self.core.persona_publish.current(self.character)
-        if self.service.settings.require_published_persona and not published.available:
+        friend = is_friend_subject(scope["subject"])
+        if self.service.settings.require_published_persona and not published.available and not friend:
             raise ApiError("chat_unavailable", "publish the initial persona before requesting context")
         projection = dict(published.projection) if published.available else self.core.persona_card_service.render_projection(self.character)
         sections = {section.section_id: section.scope for section in card.sections}
@@ -142,6 +143,8 @@ class ServiceProtocol:
         projection = {key: text for key, text in projection.items() if key in sections
                       and row_matches_subject(section_scopes.get(key, {}), scope["subject"])
                       and scene_applies(section_scopes.get(key, {}).get("applies_to"), scene_object(scope["scene"]))}
+        if friend:
+            projection = {}
         correction = self.core.correction_service.block(
             self.character, subject=scope["subject"], scene=scene_object(scope["scene"]),
         )
@@ -157,11 +160,11 @@ class ServiceProtocol:
         # Required constraints are read independently of the optional recall budget.
         receipt_id = "ctx_" + uuid.uuid4().hex
         result = {
-            "character_id": self.character, "persona_version": published.version if published.available else "",
-            "card_revision": published.revision if published.available else card.revision,
+            "character_id": self.character, "persona_version": published.version if published.available and not friend else "",
+            "card_revision": 0 if friend else published.revision if published.available else card.revision,
             "projection": projection, "persona": "\n\n".join(projection.values()),
             "expression": self.expression(projection, card, published),
-            "memory_awareness": awareness,
+            "memory_awareness": {} if friend else awareness,
             "context": recall, "corrections": {"block": correction.block, "version": correction.version},
             "recent_turns": self.recent(scope), "context_receipt_id": receipt_id,
             "expires_in_s": 300,

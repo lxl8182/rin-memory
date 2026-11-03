@@ -116,6 +116,11 @@ def subject_key(value: Any) -> str:
     return ""
 
 
+def is_friend_subject(value: Any) -> bool:
+    """QQ friend subjects use facts without owner state or persona growth."""
+    return subject_key(value).startswith("qq-friend:")
+
+
 def row_matches_subject(row: Any, subject: Any) -> bool:
     """Whether a stored row belongs to `subject`; private covers unmarked rows.
 
@@ -281,6 +286,7 @@ __all__ = [
     "entry_is_invalidated",
     "fact_invalidated",
     "filter_valid_entries",
+    "is_friend_subject",
     "normalize_text",
     "persona_invalidated",
     "reflection_invalidated",
