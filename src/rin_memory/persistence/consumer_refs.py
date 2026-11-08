@@ -113,6 +113,7 @@ def normalize_ref(row: Any) -> dict[str, Any] | None:
         "persona_version": _text(row.get("persona_version"), MAX_VERSION_CHARS),
         "context_generation": _text(generation, MAX_VERSION_CHARS),
         "deletion_version": _as_int(row.get("deletion_version")),
+        "phase": "reserved" if row.get("phase") == "reserved" else "adopted",
         "reserved_at": _text(row.get("reserved_at"), 40),
     }
 
@@ -199,6 +200,8 @@ class ConsumerRefStore:
             rows = document["refs"]
             key = _key(normalized)
             existing = next((item for item in rows if _key(item) == key), None)
+            if existing is not None and existing["phase"] == "adopted" and normalized["phase"] == "reserved":
+                return False
             if existing is not None and _same(existing, normalized):
                 return False
             if not normalized["reserved_at"]:

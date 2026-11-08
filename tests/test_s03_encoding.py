@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from rin_memory.adapters.composition import build_memory_core
+from test_b04_extraction import extraction_reply
 from rin_memory.domain.barrier import message_text
 from rin_memory.domain.extraction import ExtractionSettings
 
@@ -46,12 +47,12 @@ class CapturingModel:
 
     async def invoke(self, tier, messages, *, max_output_tokens, timeout_s, purpose):
         self.prompts.append(messages[0]["content"] if messages else "")
-        return json.dumps([{
+        return extraction_reply([{
             "text": "用户喜欢乌龙茶",
             "importance": 7,
             "source": "user_observation",
             "entity": "master",
-        }], ensure_ascii=False)
+        }], messages[0]["content"])
 
 
 class ChineseChainTests(unittest.IsolatedAsyncioTestCase):

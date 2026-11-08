@@ -303,7 +303,7 @@ def normalize_correction_spec(spec: Any, *, now: str) -> dict[str, Any] | None:
                  *sorted(target_fact_ids), *sorted(target_source_keys)]
             ),
         )
-        correction_id = fact_correction_id(
+        correction_id = spec.get("operation_id") or fact_correction_id(
             source_key, target_fact_ids, target_source_keys,
             old_text, new_text, action,
         )

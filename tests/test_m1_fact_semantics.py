@@ -16,8 +16,11 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from test_b04_extraction import extraction_reply
+
 from rin_memory.adapters.composition import build_memory_core
 from rin_memory.contracts import DeletionRequest, Scope
+from rin_memory.domain.extraction import ExtractionSettings
 
 
 class FixedClock:
@@ -47,7 +50,7 @@ class FakeModel:
             item = self.responses.pop(0)
             if isinstance(item, Exception):
                 raise item
-            return item
+            return extraction_reply(item, messages[0]["content"]) if purpose == "memory_fact_extraction" else item
         return "[]"
 
 
@@ -143,6 +146,38 @@ class FactSemanticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(facts), 1)
         self.assertEqual(facts[0]["source_event_keys"], ["host:demo:private:r1"])
         self.assertEqual(facts[0]["confirm_count"], 1)
+
+    async def test_deleting_one_required_source_drops_the_composite_fact(self):
+        model = FakeModel([{"facts": [{"text": "用户叫林舟，住在潮桥", "sources": [1, 2]}]}])
+        core = build_memory_core(
+            memory_root=self.root / "memory", clock=self.clock, model=model,
+            extraction_settings=ExtractionSettings(inline=False, batch_max_turns=2),
+        )
+        first, second = "host:demo:private:joint1", "host:demo:private:joint2"
+        await core.extraction.ingest_turn("demo", [human("我叫林舟")], source_key=first, session_id="s1")
+        self.clock.advance(seconds=1)
+        await core.extraction.ingest_turn("demo", [human("我住在潮桥")], source_key=second, session_id="s1")
+        await core.extraction.process_outbox("demo")
+        self.assertEqual(len(core.facts.load("demo")), 1)
+        await core.deletion_service.forget(DeletionRequest(scope=Scope("demo"), source_keys=(second,)))
+        self.assertEqual(core.facts.load("demo"), [])
+        self.assertEqual((await core.recall.recall_memory("demo", "潮桥"))["items"], [])
+        self.assertEqual((await core.recall.recall_memory("demo", "林舟"))["items"][0]["kind"], "original")
+
+    async def test_explicit_memory_is_durable_without_waiting_for_the_extractor(self):
+        model = FakeModel()
+        core = await self._core(model)
+        key = "host:demo:private:remember"
+        for _ in range(2):
+            await core.extraction.ingest_turn(
+                "demo", [human("请记住：我不喝牛奶。")], source_key=key,
+                occurred_at=self.clock.now(), inline=False,
+            )
+        [fact] = core.facts.load("demo")
+        self.assertIn("我不喝牛奶", fact["text"])
+        self.assertEqual(fact["source_event_keys"], [key])
+        self.assertEqual(fact["confirm_count"], 1)
+        self.assertEqual(model.calls, [])
 
     # -- G11: relative time resolves against the turn, not the queue ------
 

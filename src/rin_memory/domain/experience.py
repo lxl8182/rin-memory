@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
 from ..classification import metadata_of
@@ -51,3 +51,33 @@ def message_material(message: Mapping[str, Any]) -> dict[str, Any]:
         "occurred_at": meta.get("occurred_at") or message.get("timestamp"),
         "text": message_text(message).strip(),
     }
+
+def user_confirmation_bindings(row: Mapping[str, Any]) -> list[dict[str, Any]]:
+    keys = set(row.get("source_event_keys") or ())
+    return [binding for binding in row.get("source_bindings") or ()
+            if isinstance(binding, Mapping) and binding.get("role") == "user"
+            and binding.get("evidence_kind") in ("user_assertion", "explicit_feedback")
+            and binding.get("source_key") in keys]
+
+
+def confirmation_time(row: Mapping[str, Any]) -> datetime | None:
+    """Business time from surviving user evidence, independent of record usage."""
+    dates = []
+    for binding in user_confirmation_bindings(row):
+        stamp = binding.get("occurred_at")
+        if isinstance(stamp, str):
+            try:
+                date = datetime.fromisoformat(stamp)
+            except ValueError:
+                continue
+            dates.append(date.replace(tzinfo=date.tzinfo or timezone.utc))
+    return max(dates, default=None)
+
+
+def fact_support_groups(row: Mapping[str, Any]) -> list[list[str]]:
+    """Each group is sufficient evidence, but every source in it is required."""
+    if "support_groups" in row:
+        return [list(group) for group in row["support_groups"]]
+    keys = list(row.get("source_event_keys") or ())
+    # Legacy rows did not distinguish independent confirmations from synthesis.
+    return [keys] if keys else []

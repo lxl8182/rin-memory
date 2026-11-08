@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from rin_memory.adapters.composition import build_memory_core
+from test_b04_extraction import extraction_reply
 from rin_memory.classification import CHAT, UNCLASSIFIED, classify_message
 from rin_memory.contracts import DeletionRequest, Scope
 from rin_memory.domain.extraction import ExtractionSettings
@@ -42,7 +43,8 @@ class FakeModel:
 
     async def invoke(self, tier, messages, *, max_output_tokens, timeout_s, purpose):
         self.calls.append({"messages": messages, "purpose": purpose})
-        return self.responses.pop(0) if self.responses else "[]"
+        reply = self.responses.pop(0) if self.responses else "[]"
+        return extraction_reply(reply, messages[0]["content"]) if purpose == "memory_fact_extraction" else reply
 
 
 def human(text: str) -> dict:

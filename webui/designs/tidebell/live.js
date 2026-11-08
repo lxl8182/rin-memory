@@ -991,6 +991,7 @@
   }
 
   function renderPersona() {
+    if (SERVICE && $("#qqPersonaPanel") && qqPersonaRevision === null && !qqPersonaBusy) loadQqPersona();
     const persona = LIVE.snapshot.persona || {};
     const card = persona.card || { sections: [], revision: 0 };
     const sections = card.sections || [];
@@ -1053,6 +1054,41 @@
         + (previous ? '<a data-live-rollback="' + esc(previous.version) + '">回滚到上一版</a>' : '<span class="dim">暂无回滚点</span>');
     }
     if (revisions.length) showLiveRevision(revisions[0].revision);
+  }
+
+  let qqPersonaRevision = null;
+  let qqPersonaBusy = false;
+
+  async function loadQqPersona() {
+    await editQqPersona(false);
+  }
+
+  async function editQqPersona(save) {
+    if (qqPersonaBusy || (save && qqPersonaRevision === null)) return;
+    qqPersonaBusy = true;
+    const panel = $("#qqPersonaPanel");
+    const field = $("#qqPersonaText");
+    const status = $("#qqPersonaStatus");
+    panel.hidden = false;
+    field.disabled = $("#qqPersonaSave").disabled = $("#qqPersonaReload").disabled = true;
+    status.textContent = save ? "保存中" : "读取中";
+    try {
+      const value = await api("/v1/qq/persona", save ? {
+        method: "POST", body: JSON.stringify({ text: field.value, base_revision: qqPersonaRevision }),
+      } : undefined);
+      qqPersonaRevision = value.revision;
+      field.value = value.text;
+      status.textContent = value.text ? "第 " + value.revision + " 版" : "使用 QQ 预设";
+      if (save) toast("QQ 私聊人设已保存");
+    } catch (error) {
+      status.textContent = error.status === 409
+        ? "已有新版本。草稿已保留，可先复制草稿再重新读取。"
+        : (save ? "保存失败：" : "读取失败：") + error.message;
+    } finally {
+      qqPersonaBusy = false;
+      field.disabled = $("#qqPersonaSave").disabled = qqPersonaRevision === null;
+      $("#qqPersonaReload").disabled = false;
+    }
   }
 
   function showLiveRevision(revisionNumber) {
@@ -2828,6 +2864,13 @@
 
   bindChat();
   bindModelConfig();
+  if (SERVICE) {
+    $("#qqPersonaForm")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      editQqPersona(true);
+    });
+    $("#qqPersonaReload")?.addEventListener("click", loadQqPersona);
+  }
   refresh();
   if (SERVICE) setInterval(() => { if (!LIVE.connected && !document.hidden) refresh(); }, 10000);
 })();

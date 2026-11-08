@@ -22,6 +22,8 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
+from test_b04_extraction import extraction_reply
+
 from rin_memory.service.management import ManagementApi
 from rin_memory.service.memory_service import MemoryService, ServiceSettings
 from rin_memory.service.server import MemoryApi, build_server
@@ -48,13 +50,16 @@ class FakeModel:
                 str(message.get("content") or "") for message in messages
                 if isinstance(message, dict)
             )
-            lines = [line.split("| user |", 1)[-1].split("| message_ref=", 1)[0].strip()
-                     for line in prompt.splitlines() if "| user |" in line]
-            text = (lines[-1] if lines else "").strip().rstrip("。")
-            if not text:
+            lines = [line for line in prompt.splitlines() if line.startswith("[") and "| user |" in line]
+            if not lines:
                 return "[]"
-            return json.dumps([{"text": text, "importance": 7, "entity": "master"}],
-                              ensure_ascii=False)
+            line = lines[-1]
+            text = line.split("| user |", 1)[-1].split("| message_ref=", 1)[0].strip().rstrip("。")
+            index = int(line[1:].split("]", 1)[0])
+            return extraction_reply([{"text": text, "importance": 7, "entity": "master", "sources": [index]}], prompt)
+        if purpose == "memory_recall_selection":
+            offered = json.loads(messages[-1]["content"])["candidates"]
+            return json.dumps({"selected": [{"key": item["key"], "use": "记忆查询"} for item in offered[:3]]})
         return "[]"
 
 
@@ -80,7 +85,7 @@ class LimitedMemoryClientTests(unittest.TestCase):
         )
         self.service = MemoryService.start(self.settings)
         self.model = FakeModel()
-        for name in ("extraction", "compression"):
+        for name in ("extraction", "recall", "compression"):
             getattr(self.service.core, name)._model = self.model
         self.api = MemoryApi(self.service)
         self.management = ManagementApi(self.service)

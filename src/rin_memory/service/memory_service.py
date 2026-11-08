@@ -30,6 +30,7 @@ from ..domain.persona_teaching import PersonaTeachingService
 from ..domain.turns import TurnCommitService
 from ..domain.evolution import EvolutionSettings
 from ..domain.extraction import ExtractionSettings
+from ..domain.recall import RecallSettings
 from ..errors import RootLockConflict
 from ..persistence.ownership import RootLock, acquire_root_lock
 from ..persistence.persona_teaching import PersonaTeachingStore
@@ -72,7 +73,7 @@ class ServiceSettings:
     #: Hard cap on a single `/chat` generation, seconds.
     chat_timeout_s: float = 60.0
     #: Context building budget (§6.1: the 1000 ms figure is the context budget).
-    context_budget_ms: int = 1000
+    context_budget_ms: int = 9000
     #: Bounded request body size (§4.3 capacity limits).
     max_body_bytes: int = 2 * 1024 * 1024
     #: Refuse new chat work above this many in-flight requests.
@@ -94,6 +95,7 @@ class ServiceSettings:
     batch_max_turns: int = 5
     #: Input budget for one batch call; a bigger group is split before the call.
     batch_max_messages: int = 16
+    memory_enabled: bool = True
 
 
 @dataclass
@@ -239,10 +241,12 @@ class MemoryService:
                 model=model,
                 evolution_settings=EvolutionSettings(enabled=True),
                 extraction_settings=ExtractionSettings(
+                    enabled=settings.memory_enabled,
                     batch_idle_seconds=settings.batch_idle_seconds,
                     batch_max_turns=settings.batch_max_turns,
                     batch_max_messages=settings.batch_max_messages,
                 ),
+                recall_settings=RecallSettings(enabled=settings.memory_enabled, fast_chat=True),
             )
             service = cls(settings, core=core, lock=lock, model=model)
             recovery = core.recover(settings.character)
@@ -287,6 +291,9 @@ class MemoryService:
 
     async def start_background(self) -> None:
         """Start the per-character maintenance loop (§4.3)."""
+        if not self.settings.memory_enabled:
+            self.state.background_reason = "memory_paused"
+            return
         maintenance = getattr(self.core, "maintenance", None)
         if maintenance is None:
             self.state.background_reason = "maintenance is not wired"

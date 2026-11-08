@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any, Mapping, Sequence
@@ -27,15 +28,16 @@ from ..classification import (
 from ..contracts import CorrectionRequest, MemoryEvent, Scene, Scope
 from ..domain.barrier import DeletionBarrier, message_source_keys, message_text
 from ..event_sources import parse_source_key
-from ..invalidation import is_friend_subject, row_matches_subject, scene_applies
+from ..invalidation import filter_valid_entries, is_friend_subject, row_matches_subject, scene_applies, subject_key
 from ..persistence.facts_view import FactsView
 from ..persistence.gates import SuppressionGate
 from ..persistence.outbox import OutboxStore
 from ..persistence.recent import RecentStore
 from ..ports import Clock, EventSink, ModelInvoker, StorageRoots, WritePermit
 from .profile import SIGNAL_PROMPT
+from .recall import RETENTION_CLASSES, bm25_scores
 from .prompt_voice import FIRST_PERSON_VOICE
-from .experience import message_material, message_role, number_messages
+from .experience import confirmation_time, fact_support_groups, message_material, message_role, number_messages, user_confirmation_bindings
 from .persona_card import EXAMPLES_BANNER
 
 DEFAULT_TIER = "summary"
@@ -72,6 +74,20 @@ EVIDENCE_BY_SOURCE = {
 }
 #: Cap on retained evidence keys per fact (mirrors reflection.MAX_SOURCE_KEYS).
 MAX_FACT_SOURCE_KEYS = 32
+_EXPLICIT_MEMORY = re.compile(
+    r"^(?:(?:以后|长期)?(?:请|帮我|麻烦你)?记住(?:这条|这一点|一下)?[\s：:，,]*"
+    r"(?P<zh>我[^？！?!\n]+)|(?:please\s+)?remember(?:\s+that|\s*:)?\s+(?P<en>I\b[^?!\n]+))$",
+    re.IGNORECASE,
+)
+_TEMPORARY_MEMORY = re.compile(r"今天|明天|后天|待会|一会|下周|提醒我|[Tt]oday|[Tt]omorrow|[Nn]ext week")
+_UNCERTAIN_MEMORY = re.compile(r"^(?:我(?:想知道|不确定|怀疑|猜|是不是|可能)|I (?:wonder|might|may|guess)\b)", re.I)
+_PRIORITY_MEMORY = re.compile(
+    r"^(?:你(?:刚才)?记错了|纠正一下|更正一下|我对[^，。！？]{1,24}过敏|"
+    r"我(?:一直|长期|从来)(?:都)?(?:不能|不吃|不喝)|我不能(?:吃|喝)|"
+    r"correction:|you misremembered\b|i am allergic to\b)", re.I,
+)
+_OLD_FACT_LIMIT = 12
+_OLD_FACT_CHARS = 3600
 #: Upper bound for a full outbox drain (the store requires a limit).
 _DRAIN_LIMIT = 1000
 
@@ -122,6 +138,7 @@ class ExtractionSettings:
     #: docs/rin-next-optimization-plan.md 6.2.
     batch_idle_seconds: float = 0.0
     batch_max_messages: int = MAX_WINDOW_MESSAGES
+    enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -202,6 +219,7 @@ class ExtractionService:
         self._proactive = proactive
         self._interests = interests
         self._persona_reader = persona_reader
+        self.notify_priority = None
 
     # -- ingest ----------------------------------------------------------
 
@@ -252,6 +270,7 @@ class ExtractionService:
         kind, _, value = str(origin.get("scene") or "").partition(":")
         if value:
             scene = replace(scene, **{{"game": "game_id", "plugin": "plugin_id"}.get(kind, "session_id"): value})
+        structured_event = event is not None and event.event_type == "scene_experience"
         event = event or MemoryEvent(
             scope=Scope(character=character, subject=subject),
             source_key=source_key,
@@ -276,6 +295,9 @@ class ExtractionService:
             metadata.setdefault("scene", "game:" + scene.game_id if scene.game_id else "plugin:" + scene.plugin_id if scene.plugin_id else "")
             metadata.setdefault("session_id", session_id or scene.session_id)
             metadata.setdefault("content_class", classification)
+            if (classification == SHARED_EXPERIENCE and parsed.get("kind") == "plugin" and len(clean) == 1
+                    and (structured_event or scene.game_id)):
+                metadata["structured_experience"] = True
             # Batch scope (RO02): every message carries the identity the batch
             # key is built from, so a queued op is self-describing even when the
             # payload predates the batch fields below.
@@ -288,11 +310,19 @@ class ExtractionService:
             if "metadata" in message:
                 message["metadata"] = metadata
         clean = number_messages(clean, [source_key], now)
+        remember = _EXPLICIT_MEMORY.fullmatch(user_text.strip()) if is_extractable(classification) else None
+        explicit = (remember.group("zh") or remember.group("en")).strip() if remember else ""
+        if explicit and (_TEMPORARY_MEMORY.search(explicit) or _UNCERTAIN_MEMORY.search(explicit)
+                         or re.search(r"[。；;]", explicit.rstrip("。")) or len(explicit) > MAX_FACT_TEXT - 24):
+            explicit = ""
         if self._barrier.blocks_event(event):
             return IngestResult("deleted", source_key, classification, episode_id,
                                 reason="deleted_source")
         receipt = await self._sink.append(event)
         if receipt.status == "duplicate":
+            if explicit and self._settings.enabled:
+                self._save_explicit(character, clean, explicit, source_key, episode_id, now)
+                return IngestResult("duplicate", source_key, classification, episode_id, reason="duplicate_source")
             # A retry after a crash between "raw turn saved" and "outbox op
             # enqueued" used to return here and leave the turn permanently
             # unextractable. The retry carries the same messages, so the window
@@ -319,6 +349,9 @@ class ExtractionService:
         if kept:
             self._recent.append(character, kept)
             self._store_raw(character, kept, session_id or _session_from(scene, episode_id))
+        if not self._settings.enabled:
+            return IngestResult("accepted", source_key, classification, episode_id,
+                                reason="memory_paused")
         if self._proactive is not None and is_extractable(classification):
             self._proactive.absorb_user_turn(
                 character, text=user_text, subject=subject,
@@ -339,6 +372,10 @@ class ExtractionService:
         if gate_state is not None and gate_state.suppressed:
             return IngestResult("accepted", source_key, classification, episode_id,
                                 reason="gate_suppressed")
+        if explicit:
+            written = self._save_explicit(character, kept, explicit, source_key, episode_id, now)
+            return IngestResult("extracted", source_key, classification, episode_id,
+                                facts_written=written, reason="explicit_memory")
         payload = {
             "messages": kept,
             "source_keys": [source_key],
@@ -352,10 +389,13 @@ class ExtractionService:
             # metadata: two turns may only share one model call when all five
             # of character/subject/client/session/scene agree (design 6.2).
             "batch_scope": _batch_scope(character, metadata_of(clean[0])),
+            "priority": bool(_PRIORITY_MEMORY.search(user_text.strip())),
         }
         op_id = self._outbox.enqueue(character, EXTRACT_OP_TYPE, payload)
         should_inline = self._settings.inline if inline is None else inline
         if not should_inline:
+            if payload["priority"] and self.notify_priority is not None:
+                self.notify_priority(character)
             return IngestResult("accepted", source_key, classification, episode_id,
                                 op_id=op_id, reason="queued")
         outcome = await self.extract_facts(
@@ -374,6 +414,29 @@ class ExtractionService:
         self._outbox.complete(character, op_id)
         return IngestResult("extracted", source_key, classification, episode_id,
                             facts_written=outcome.facts_written, op_id=op_id)
+
+    def _save_explicit(self, character, messages, text, source_key, episode_id, occurred_at):
+        if self._gate is not None and self._gate.gate_for(character).suppressed:
+            return 0
+        with self._barrier.write_lock(character):
+            kept = self._barrier.filter_messages(character, messages)
+            message = next((item for item in kept if _is_human_message(item)), None)
+            if message is None:
+                return 0
+            metadata = metadata_of(message)
+            binding = message_material(message)
+            binding.pop("text")
+            binding.update(source_key=source_key, evidence_kind="user_assertion")
+            written, _ = self._persist_candidates(
+                character, [{
+                    "operation": "add", "text": f"我记得对方明确说过：「{text}」",
+                    "entity": "master", "source": "user_observation", "retention_class": "durable",
+                    "subject": metadata.get("subject", "private"), "applies_to": metadata.get("applies_to") or {},
+                    "source_event_keys": [source_key], "source_bindings": [binding],
+                    "message_refs": [binding["message_ref"]],
+                }], source_keys=(), window_keys=[source_key], episode_id=episode_id, occurred_at=occurred_at,
+            )
+            return written
 
 
 
@@ -396,7 +459,7 @@ class ExtractionService:
         state as if enqueue had happened before the crash: one saved turn, one
         op.
         """
-        if not is_extractable(classification):
+        if not self._settings.enabled or not is_extractable(classification):
             return None
         if self._outbox.find_by_source_key(
             character, source_key, op_type=EXTRACT_OP_TYPE,
@@ -415,8 +478,13 @@ class ExtractionService:
             "language": language,
             "occurred_at": (occurred_at or self._clock.now()).isoformat(),
             "batch_scope": _batch_scope(character, metadata_of(kept[0])),
+            "priority": any(_is_human_message(item) and _PRIORITY_MEMORY.search(message_text(item).strip())
+                            for item in kept),
         }
-        return self._outbox.enqueue(character, EXTRACT_OP_TYPE, payload)
+        op_id = self._outbox.enqueue(character, EXTRACT_OP_TYPE, payload)
+        if payload["priority"] and self.notify_priority is not None:
+            self.notify_priority(character)
+        return op_id
 
     async def process_outbox(
         self, character: str, *, limit: int | None = None,
@@ -431,6 +499,8 @@ class ExtractionService:
         client, session and scene, so nothing is ever merged across a session
         or a subject.
         """
+        if not self._settings.enabled:
+            return ()
         # The dispatcher's bulk contract is "drain every pending op of this
         # type", so the default is the whole queue: a partial drain would leave
         # a batch half-completed and turn the next round into a second call for
@@ -482,6 +552,9 @@ class ExtractionService:
             outcome = ExtractionOutcome("failed", reason=f"error:{type(exc).__name__}")
         self._settle_op(character, [op.op_id], outcome)
         return outcome
+
+    def _barrier_outcome_status(self, character, keys):
+        return "stale" if set(keys) & self._barrier.state(character).index.source_keys else "failed"
 
     def _settle_op(
         self, character: str, op_ids: Sequence[str], outcome: ExtractionOutcome,
@@ -563,6 +636,12 @@ class ExtractionService:
         messages = 0
         for op in ordered:
             payload = dict(op.payload)
+            if payload.get("priority"):
+                if current:
+                    batches.append(current)
+                    current, messages = [], 0
+                batches.append([op])
+                continue
             count = len([
                 message for message in payload.get("messages") or ()
                 if isinstance(message, Mapping)
@@ -655,14 +734,18 @@ class ExtractionService:
             key for message in reference for key in message_source_keys(message)
         } - set(all_keys))
         identity = self._identity_prompt(character, metadata)
+        old_facts = self._related_facts(character, kept, metadata, reference=reference)
         prompt = identity + _build_batch_prompt(utterances, reference)
+        prompt += _old_fact_material(old_facts)
+        prompt += self._applied_correction_material(character, all_keys, metadata)
         if self._conversation_state is not None and not is_friend_subject(metadata.get("subject")):
             state = self._conversation_state.snapshot(character, metadata)
             prompt += (
                 "\n\n我同时整理正在关注的事项，以第一人称写 text、next_step 和 why。输出采用 JSON 对象："
                 '{"facts":[上述事实],"state_updates":[事项操作]}。'
                 "事实或事项为空时分别使用空数组。我从明确计划、正在处理的事、"
-                "后续进展和完成/取消记录中整理事项。"
+                "后续进展和完成/取消记录中整理事项。只在用户明确承诺、接受、正在做或实际要求跟进时建事项。"
+                "开放讨论、建议、问能力、当前一次性的请求与尚未接受的提议留在对话里。"
                 "操作采用 set_progress/set_concern/close_progress/close_concern。"
                 "更新或结束本批前面新建的事项时，引用同一条操作里给出的 ref；"
                 "更新或结束列表中已有的旧事项时，引用它的 id。新建时填写 ref，id 留空。"
@@ -709,7 +792,8 @@ class ExtractionService:
             return outcome
         if self._barrier.is_stale(character, snapshot):
             outcome = ExtractionOutcome(
-                "stale", reason="barrier_stale", batch_id=batch_id,
+                self._barrier_outcome_status(character, all_keys),
+                reason="barrier_stale", batch_id=batch_id,
                 source_keys=tuple(all_keys),
             )
             self._settle_op(character, op_ids, outcome)
@@ -737,16 +821,19 @@ class ExtractionService:
                 _bind_candidate(candidate, utterances) for candidate in raw_candidates
             ) if candidate is not None
         ]
-        written, persisted = self._persist_candidates(
-            character, candidates,
-            # Each candidate already carries the keys it cited, so the shared
-            # span stays empty here: a batched fact must never inherit the
-            # whole batch as evidence. The full key set is passed separately as
-            # the deletion fence (window_keys).
-            source_keys=(), context_refs=reference_keys, episode_id=episode_id,
-            occurred_at=utterances[0]["occurred_at"],
-            window_keys=sorted(all_keys),
-        )
+        with self._barrier.write_lock(character):
+            written, persisted, error = self._apply_facts(
+                character, candidates, old_facts, snapshot,
+                window_keys=all_keys, context_refs=reference_keys, episode_id=episode_id,
+                occurred_at=utterances[0]["occurred_at"],
+            )
+        if error:
+            outcome = ExtractionOutcome(
+                self._barrier_outcome_status(character, all_keys) if error == "barrier_stale" else "failed",
+                reason=error, batch_id=batch_id, source_keys=tuple(all_keys),
+            )
+            self._settle_op(character, op_ids, outcome)
+            return outcome
         state_applied = 0
         if self._conversation_state is not None and raw_updates and not is_friend_subject(metadata.get("subject")):
             entries = _bind_state_updates(raw_updates, utterances)
@@ -822,6 +909,8 @@ class ExtractionService:
         occurred_at: datetime | None = None,
     ) -> ExtractionOutcome:
         """Extract and persist facts from one window (None=failure, []=empty)."""
+        if not self._settings.enabled:
+            return ExtractionOutcome("empty", reason="memory_paused")
         settings = self._settings
         window = [
             dict(message) for message in messages or ()
@@ -857,12 +946,13 @@ class ExtractionService:
         metadata = metadata_of(kept[0])
         state_updates = []
         signals = []
-        if content_class == SHARED_EXPERIENCE:
+        snapshot = self._barrier.snapshot(character)
+        old_facts = {}
+        if content_class == SHARED_EXPERIENCE and _structured_experience(character, kept, evidence_keys):
             candidates = [_shared_experience_candidate(kept)]
         else:
             if self._model is None:
                 return ExtractionOutcome("failed", reason="model_unavailable")
-            snapshot = self._barrier.snapshot(character)
             context = self._prompt_context(character, messages, kept[0], evidence_keys)
             context, _ = filter_messages_for_extraction(
                 context, legacy_barrier_cutoff=legacy_cutoff, deleted_source_keys=deleted_keys,
@@ -872,14 +962,17 @@ class ExtractionService:
                 key for message in context for key in message_source_keys(message)
             } - set(evidence_keys))
             identity = self._identity_prompt(character, metadata)
-            prompt = identity + _build_prompt(kept, context)
+            old_facts = self._related_facts(character, kept, metadata, reference=context)
+            prompt = identity + _build_prompt(kept, context) + _old_fact_material(old_facts)
+            prompt += self._applied_correction_material(character, evidence_keys, metadata)
             if self._conversation_state is not None and not is_friend_subject(metadata.get("subject")):
                 state = self._conversation_state.snapshot(character, metadata)
                 prompt += (
                     "\n\n我同时整理正在关注的事项，以第一人称写 text、next_step 和 why。输出采用 JSON 对象："
                     '{"facts":[上述事实],"state_updates":[事项操作]}。'
                     "事实或事项为空时分别使用空数组。我从明确计划、正在处理的事、"
-                    "后续进展和完成/取消记录中整理事项。"
+                    "后续进展和完成/取消记录中整理事项。只在用户明确承诺、接受、正在做或实际要求跟进时建事项。"
+                "开放讨论、建议、问能力、当前一次性的请求与尚未接受的提议留在对话里。"
                     "操作采用 set_progress/set_concern/close_progress/close_concern；"
                     "更新或结束已有事项引用下面的 id，新建时 id 留空。"
                     "操作字段为 op/id/text/next_step/why。next_step 写适合后续交流的具体下一步。"
@@ -908,7 +1001,7 @@ class ExtractionService:
                 return ExtractionOutcome("failed", reason="parse")
             candidates, state_updates, signals = parsed
             if self._barrier.is_stale(character, snapshot):
-                return ExtractionOutcome("stale", reason="barrier_stale")
+                return ExtractionOutcome(self._barrier_outcome_status(character, evidence_keys), reason="barrier_stale")
             if identity != self._identity_prompt(character, metadata):
                 return ExtractionOutcome("stale", reason="persona_changed")
         utterances = [{
@@ -922,11 +1015,15 @@ class ExtractionService:
             return ExtractionOutcome("failed", reason="unresolved_sources")
         bound = [_bind_candidate(candidate, utterances) for candidate in candidates]
         candidates = [dict(row, context_refs=context_keys) for row in bound if row is not None]
-        written, persisted = self._persist_candidates(
-            character, candidates, source_keys=(), window_keys=evidence_keys,
-            context_refs=context_keys, episode_id=episode_id,
-            occurred_at=occurred_at,
-        )
+        with self._barrier.write_lock(character):
+            written, persisted, error = self._apply_facts(
+                character, candidates, old_facts, snapshot,
+                window_keys=evidence_keys, context_refs=context_keys, episode_id=episode_id,
+                occurred_at=occurred_at,
+            )
+        if error:
+            status = self._barrier_outcome_status(character, evidence_keys) if error == "barrier_stale" else "failed"
+            return ExtractionOutcome(status, reason=error)
         if self._conversation_state is not None and not is_friend_subject(metadata.get("subject")):
             try:
                 self._conversation_state.apply(
@@ -1003,6 +1100,99 @@ class ExtractionService:
 
     # -- persistence -----------------------------------------------------
 
+    def _applied_correction_material(self, character, keys, metadata):
+        if self._corrections is None:
+            return ""
+        rows = self._corrections.extracted(character, keys, subject=metadata.get("subject"))
+        if not rows:
+            return ""
+        return "\n本批原话已应用的更正（不重复新增或确认）：\n" + json.dumps(
+            [{"source_key": row["source_key"], "text": row["text"]} for row in rows], ensure_ascii=False,
+        )
+
+    def _related_facts(self, character, messages, metadata, *, reference=()):
+        current = " ".join(message_text(row) for row in messages if _is_human_message(row))
+        previous = " ".join(message_text(row) for row in reference if _is_human_message(row))
+        query = current[:3200] + " " + previous[-800:]
+        applies_to = metadata.get("applies_to") or {}
+        scene_kind, _, scene_id = str(metadata.get("scene") or "").partition(":")
+        scene = dict(applies_to, session_id=metadata.get("session_id") or "")
+        if scene_kind in ("game", "plugin"):
+            scene[scene_kind + "_id"] = scene_id
+        rows = [
+            row for row in self._valid_facts(character)
+            if row.get("id") and row_matches_subject(row, metadata.get("subject"))
+            and scene_applies(row.get("applies_to"), scene)
+        ]
+        result = {}
+        chars = _OLD_FACT_CHARS
+        for row, _, _ in bm25_scores(query, rows):
+            size = len(json.dumps(_old_fact_view(row), ensure_ascii=False)) + 2
+            if size > chars:
+                continue
+            result[row["id"]] = row
+            chars -= size
+            if len(result) == _OLD_FACT_LIMIT:
+                break
+        return result
+
+    def _valid_facts(self, character):
+        archive = [row for row in self._facts.load_archive(character)
+                   if not row.get("subject_archived_at") and not row.get("arbitration_archived_at")]
+        return self._barrier.filter_rows(character, filter_valid_entries(self._facts.load(character) + archive))
+
+    def _apply_facts(self, character, candidates, old_facts, snapshot, *, window_keys,
+                     context_refs, episode_id, occurred_at):
+        """Validate every operation before making any of the batch's writes."""
+        if self._barrier.is_stale(character, snapshot):
+            return 0, [], "barrier_stale"
+        subject = candidates[0].get("subject") if candidates else None
+        completed = (self._corrections.extracted(character, window_keys, subject=subject, repair=True)
+                     if self._corrections else ())
+        latest = {row["id"]: row for row in reversed(self._valid_facts(character)) if row.get("id")}
+        completed_keys = {row["source_key"] for row in completed}
+        corrections = {}
+        for candidate in candidates:
+            operation = candidate["operation"]
+            if operation == "add":
+                continue
+            target_id = candidate.get("target_id")
+            target = old_facts.get(target_id)
+            if (target is None or target != latest.get(target_id)
+                    or not row_matches_subject(target, candidate.get("subject"))
+                    or (target.get("entity") or "master") != (candidate.get("entity") or "master")
+                    or _scope_fields(target) != _scope_fields(candidate)
+                    or not user_confirmation_bindings(candidate)
+                    or len(user_confirmation_bindings(candidate)) != len(candidate.get("source_bindings") or ())):
+                return 0, [], "invalid_fact_target"
+            if operation == "correct":
+                if self._corrections is None or target_id in corrections:
+                    return 0, [], "invalid_fact_target"
+                source = user_confirmation_bindings(candidate)[-1]["source_key"]
+                corrections[target_id] = CorrectionRequest(
+                    scope=Scope(character, subject_key(candidate.get("subject")) or "private"),
+                    target_fact_ids=(target_id,), source_key=source,
+                    new_text=candidate["text"][:MAX_FACT_TEXT],
+                    applies_to=Scene(**dict(_scope_fields(candidate))),
+                    request_id="extract_" + _fact_hash(source + "|" + target_id + "|correct"),
+                )
+        if any(row["operation"] == "confirm" and row["target_id"] in corrections for row in candidates):
+            return 0, [], "conflicting_fact_operations"
+        # Corrections already own invalidation and the new belief. They share
+        # this write lock with extraction and deletion so their own barrier
+        # increment cannot be confused with a concurrent write.
+        # Commit independent facts before corrections. A replay of a source
+        # that already completed a correction has already saved its additions.
+        remaining = [row for row in candidates if row["operation"] != "correct"
+                     and not set(row["source_event_keys"]) <= completed_keys]
+        written, persisted = self._persist_candidates(
+            character, remaining, source_keys=(), window_keys=window_keys,
+            context_refs=context_refs, episode_id=episode_id, occurred_at=occurred_at,
+        )
+        for request in corrections.values():
+            self._corrections.correct_extracted(request)
+        return written + len(corrections), persisted, ""
+
     def _persist_candidates(
         self,
         character: str,
@@ -1036,14 +1226,14 @@ class ExtractionService:
         active = list(self._facts.load(character))
         archive = list(self._facts.load_archive(character))
         def scope_hash(row, digest):
-            return (digest, str(row.get("subject") or "private"),
-                    str(row.get("entity") or "master"),
-                    json.dumps(row.get("applies_to") or {}, sort_keys=True))
+            return (digest, subject_key(row.get("subject")) or "private",
+                    str(row.get("entity") or "master"), _scope_fields(row))
         by_hash: dict[tuple, dict[str, Any]] = {}
-        for row in active + archive:
-            digest = row.get("hash")
-            if isinstance(digest, str) and digest:
-                by_hash.setdefault(scope_hash(row, digest), row)
+        by_id = {}
+        for row in self._barrier.filter_rows(character, filter_valid_entries(active + archive)):
+            by_id.setdefault(row.get("id"), row)
+            digest = row.get("hash") or _fact_hash(row["text"])
+            by_hash.setdefault(scope_hash(row, digest), row)
         now = self._clock.now()
         # Business time of the turn, not of the queue: a batch processed the day
         # after it was spoken must still resolve "tomorrow" against the day it
@@ -1074,38 +1264,55 @@ class ExtractionService:
             if self._barrier.blocks_row(character, probe):
                 continue
             key = scope_hash(candidate, digest)
-            existing = by_hash.get(key)
+            existing = (by_id[candidate["target_id"]] if candidate["operation"] == "confirm"
+                        else by_hash.get(key))
             if existing is not None:
                 source = _candidate_source(candidate)
                 changed = False
-                if existing.get("source") == "ai_disclosure" and source == "user_observation":
-                    # User corroboration upgrades a self-disclosure once; the
-                    # reverse (user fact -> ai disclosure) never happens.
+                users = user_confirmation_bindings(candidate)
+                old_keys = set(existing.get("source_event_keys") or ())
+                old_refs = set(existing.get("message_refs") or ())
+                new_users = [binding for binding in users if binding["source_key"] not in old_keys
+                             and binding["message_ref"] not in old_refs]
+                if users and existing.get("source") == "ai_disclosure" and source == "user_observation":
                     existing["source"] = "user_observation"
                     existing["signal_processed"] = False
+                    _confirm_kind(existing)
                     changed = True
-                if _merge_source_keys(
-                    existing, sorted(set(candidate_keys) | set(evidence_span)),
-                ):
-                    changed = True
-                if _merge_context_refs(existing, context_keys):
-                    changed = True
-                for binding in candidate.get("source_bindings") or ():
-                    bindings = existing.setdefault("source_bindings", [])
-                    if binding not in bindings and len(bindings) < MAX_FACT_SOURCE_KEYS:
-                        bindings.append(dict(binding))
+                independent = any(binding["evidence_kind"] in ("observed_action", "tool_result")
+                                  for binding in candidate.get("source_bindings") or ())
+                if users or (independent and source == SHARED_EXPERIENCE):
+                    groups = fact_support_groups(existing)
+                    support = sorted(set(candidate_keys) | set(evidence_span))
+                    changed |= _merge_source_keys(
+                        existing, support,
+                    )
+                    if support and set(support) <= set(existing["source_event_keys"]) and support not in groups:
+                        existing["support_groups"] = groups + [support]
                         changed = True
-                existing["message_refs"] = list(dict.fromkeys(
-                    item["message_ref"] for item in existing.get("source_bindings") or ()
-                ))
-                if source in ("user_observation", "user_correction") and _confirm_kind(existing):
+                    for binding in candidate.get("source_bindings") or ():
+                        bindings = existing.setdefault("source_bindings", [])
+                        if (binding not in bindings and len(bindings) < MAX_FACT_SOURCE_KEYS
+                                and binding["source_key"] in existing["source_event_keys"]):
+                            bindings.append(dict(binding))
+                            changed = True
+                    if existing.get("source_bindings"):
+                        existing["message_refs"] = list(dict.fromkeys(
+                            item["message_ref"] for item in existing["source_bindings"]
+                        ))
+                changed |= _merge_context_refs(existing, context_keys)
+                kept_users = {binding["source_key"] for binding in user_confirmation_bindings(existing)}
+                new_sources = {binding["source_key"] for binding in new_users} & kept_users
+                if new_sources:
+                    _refresh_confirmation(existing)
+                    existing["confirm_count"] = _as_count(existing.get("confirm_count")) + len(new_sources)
+                    if existing.get("retention_class") not in RETENTION_CLASSES:
+                        legacy_class = existing.get("fading_class")
+                        existing["retention_class"] = (legacy_class if legacy_class in RETENTION_CLASSES
+                                                       else candidate["retention_class"])
+                    existing["absorbed"] = False
                     changed = True
-                if changed:
-                    existing["last_confirmed_at"] = now.isoformat()
-                    existing["confirm_count"] = _as_count(existing.get("confirm_count")) + 1
-                    upgrades += 1
-                    if set(candidate_keys) - set(existing.get("reflection_source_keys") or ()):
-                        existing["absorbed"] = False
+                upgrades += int(changed)
                 continue
             if key in batch_hashes:
                 continue
@@ -1169,13 +1376,15 @@ class ExtractionService:
             "embedding_text_sha256": None,
             "embedding_model_id": None,
             "source_event_keys": list(source_keys),
+            "support_groups": [list(source_keys)] if source_keys else [],
             "context_refs": list(context_refs)[:MAX_FACT_SOURCE_KEYS],
             "evidence_kind": _evidence_kind(candidate, source),
-            "last_confirmed_at": now.isoformat(),
-            "confirm_count": 1,
+            "retention_class": candidate["retention_class"],
+            "confirm_count": len({binding["source_key"] for binding in user_confirmation_bindings(candidate)}),
             "message_refs": list(candidate.get("message_refs") or ()),
             "source_bindings": list(candidate.get("source_bindings") or ()),
         }
+        _refresh_confirmation(row)
         row["subject"] = str(candidate.get("subject") or "private")
         row["applies_to"] = dict(candidate.get("applies_to") or {})
         scope_suffix = hashlib.sha256((row["subject"] + row["entity"] + json.dumps(row["applies_to"], sort_keys=True)).encode()).hexdigest()[:8]
@@ -1366,7 +1575,7 @@ def _candidate_citations(
     """Validate precise speakers; old answers retain user-turn attribution."""
     refs = candidate.get("sources") or candidate.get("utterances")
     by_index = {item["index"]: item for item in utterances}
-    if refs is None and len(utterances) == 1:
+    if refs is None and len(utterances) == 1 and candidate.get("_structured_experience"):
         refs = [utterances[0]["index"]]
     if not isinstance(refs, list) or not refs:
         return None
@@ -1374,10 +1583,6 @@ def _candidate_citations(
         return None
     cited = [by_index[index] for index in dict.fromkeys(int(ref) for ref in refs)]
     precise = candidate.get("message_refs")
-    if precise is None:
-        if not all(item.get("has_user") for item in cited):
-            return None
-        return cited, []
     if not isinstance(precise, list) or not precise or any(not isinstance(ref, str) for ref in precise):
         return None
     messages = {metadata_of(message)["message_ref"]: (item, message)
@@ -1397,7 +1602,7 @@ def _candidate_citations(
     else:
         valid = entity == "relationship" and (
             "user" in roles
-            or all(item.get("content_class") == SHARED_EXPERIENCE for item in cited)
+            or candidate.get("_structured_experience")
             or "tool" in roles
         )
     if not valid:
@@ -1407,12 +1612,14 @@ def _candidate_citations(
         binding = message_material(message)
         binding.pop("text")
         binding["source_key"] = binding["source_key"] or next(iter(item["source_keys"]), "")
+        if binding["source_key"] not in item["source_keys"] or parse_source_key(binding["source_key"]) is None:
+            return None
         kind = metadata_of(message).get("evidence_kind")
         if kind not in EVIDENCE_KINDS:
             kind = "tool_result" if message_role(message) == "tool" else (
                 "agent_expression" if message_role(message) == "assistant" else "user_assertion"
             )
-            if item.get("content_class") == SHARED_EXPERIENCE:
+            if candidate.get("_structured_experience"):
                 kind = "observed_action"
             elif candidate.get("evidence_kind") == "explicit_feedback" and message_role(message) == "user":
                 kind = "explicit_feedback"
@@ -1435,8 +1642,10 @@ def _bind_candidate(
         return None
     cited, bindings = resolved
     cited.sort(key=lambda item: (item["occurred_at"], item["index"]))
-    keys = sorted({key for item in cited for key in item["source_keys"]})
-    if not keys:
+    keys = sorted({binding["source_key"] for binding in bindings if binding["source_key"]})
+    if not keys or _candidate_source(candidate) == "ai_disclosure" and all(
+        binding["evidence_kind"] == "agent_expression" for binding in bindings
+    ):
         return None
     event_when = candidate.get("event_when")
     anchor = cited[-1]["occurred_at"]
@@ -1546,33 +1755,10 @@ def _build_batch_prompt(
         for message in reference if message_text(message).strip()
     )
     return (
-        FIRST_PERSON_VOICE
-        + "我整理这批互动里值得记住的事情：对方告诉我的信息、我的表达与选择、"
-        "共同约定、共同经历的过程和结果，以及正在延续的话题。每条消息带有轮次编号、消息引用和原始时间。\n"
-        "我结合前文理解指代和省略，确定具体的人物、对象与意思。"
-        "对方明确表达的长期喜好、习惯和约定进入长期记忆；"
-        "临时操作、一次性尺寸调整、比较或生成指令保留为本次交流的情境。"
-        "我选择意思清楚、具有具体内容的事实，同一件事合成一条，并列出支持它的本批原话编号。"
-        "对方的偏好依据来自对方自己的陈述；我的好奇和选择记作我当时的表达，"
-        "已完成的尝试按实际结果记录。示例和外部材料保留其来源身份。"
-        "我把这些具体内容整理成简洁的记忆。\n"
-        "我以自己的视角写 text，按 JSON 数组返回，元素为 "
-        '{"text": "我的第一人称记忆正文", "importance": 1-10, '
-        '"entity": "master|neko|relationship", "source": "user_observation|user_correction|ai_disclosure|shared_experience", '
-        '"sources": [轮次编号], "message_refs": ["消息引用字符串"]}。'
-        "entity 标记事情的主体：master 是对方、neko 是我、relationship 是双方关系或经历；"
-        "source 标记材料由谁提供：对方陈述用 user_observation，我自己的可见表达用 ai_disclosure，共同经历用 shared_experience。"
-        "我为每条内容选择实际支持它的消息引用；同一轮双方发言各有自己的引用。"
-        "sources 填整数轮次编号；message_refs 逐字填写对应消息 message_ref= 后的完整字符串。"
-        "sources 填写支持这条事实的本批原话编号，每条事实都有对应编号。"
-        "event_when 是可选字段：对方明确提到事件时间时填写，其余情况省略或设为 null。"
-        "格式为 start/end 各为 null 或"
-        "包含 offset（相对该句引用原话时间的整数）和 unit（minute/hour/day/week/month/year）"
-        "的对象；引用多条原话涉及多个事件时间时，按各自明确的时间分别记录。"
-        "长期偏好的事件时间通常留空。\n"
+        FIRST_PERSON_VOICE + _FACT_ADMISSION
         + ("这些原话来自游戏中的交流，我在这里提取游戏之外的生活事实和通用相处偏好。"
            "混合表述采用其中生活或相处的部分。\n" if game_dialogue else "")
-        + "事实为空时返回 []。本次输出为 JSON。\n\n"
+        + "\n\n"
         f"前文（仅供指代消解）：\n{context or '（无）'}\n\n本批互动：\n{body}"
     )
 
@@ -1630,6 +1816,8 @@ def _merge_source_keys(row: dict[str, Any], keys: Sequence[str]) -> bool:
     if not added:
         return False
     merged = (current + added)[:MAX_FACT_SOURCE_KEYS]
+    if merged == current:
+        return False
     row["source_event_keys"] = merged
     return True
 
@@ -1677,11 +1865,81 @@ def _session_from(scene: Scene, episode_id: str | None) -> str:
     ).hexdigest()[:16]
 
 
+_FACT_ADMISSION = """
+我只保存有明确后续用途的内容：有依据的个人事实、偏好、限制，以及有结果、持续影响或明确纪念意义的共同经历。
+有待处理的计划、约定、进展、普通事项的完成或取消交给事项操作。只有另有独立的持续用途才额外保存事实。普通追问、接话、玩笑、表情、附件编号和控制标签留在对话里。
+只针对当前回复的风格、长度、是否播放语音等指示属于本轮操作；对方明确说长期适用才记录为偏好。
+提问不等于兴趣，一次行为不自动成为习惯。我的随口表达、愿望、设想、即兴扮演和未获接受的建议不形成事实或共同约定。
+只记录原话能支持的内容，经历有结果才写结果，关系意义须有当事人的表达。
+我以第一人称写 text，主体和说话者由字段及原话决定。旧事实和前文只供比较或理解指代，本批原话才是证据。
+每条事实填写 text、importance（1-10）、entity（master/neko/relationship）、source（user_observation/user_correction/ai_disclosure/shared_experience）、
+sources（整数轮次编号）、message_refs（逐字复制 message_ref= 后的引用），以及 retention_reason（具体后续用途）和 retention_class。
+保留类别：durable 用于有明确依据的稳定身份、长期偏好或限制；shared_important 用于有明确重要结果、持续影响或纪念意义的经历；
+normal 用于有后续用途的普通事实或经历；daily 用于确有短期用途的信息；transient 用于已有入口需短期保留的临时信息。
+等级低也要通过准入。自己的表达和共同经历标签本身不构成长久价值。
+operation 填 add、confirm 或 correct。add 的 target_id 留空，补充时只写新增的独立内容。
+confirm 指向意义相同、主体和适用范围一致的旧 ID，只使用新的用户原话。角色复述与引用不构成确认。
+correct 指向用户明确指出记错的旧 ID，text 只写正确的新认识，引用用户原话。过去属实、现在改变时按时间新增，用正文交代当前或历史，不纠错。
+同批尚无旧 ID 的相同陈述合成一条。无合格内容时 facts=[]（或空数组）。
+姓名、住处等可独立成立的陈述分别输出。每条只引用支撑该陈述的原话；多条原话合起来才能支撑的经历才合写。
+对明确事件时间，可填写 event_when.start/end，格式为 null 或包含整数 offset 和 unit（minute/hour/day/week/month/year）的对象；
+偏好一般省略 event_when。输出 JSON。每条 facts 对象必须显式填写 operation 和 target_id，操作示意如下：
+{"operation":"add","target_id":"","retention_class":"durable","retention_reason":"以后准备饮品时优先选择这个口味",
+ "text":"我记得对方长期喜欢无糖豆浆。","entity":"master","source":"user_observation","importance":5,
+ "sources":[1],"message_refs":["此处替换为本批真实消息引用"]}。
+confirm 或 correct 同样填写 target_id 字段，值为相关旧事实中原样的 id。
+"""
+
+
+def _scope_fields(row):
+    scope = row.get("applies_to") or {}
+    return tuple((key, scope[key]) for key in ("game_id", "plugin_id", "session_id") if scope.get(key))
+
+
+def _old_fact_view(row):
+    return {key: row.get(key) for key in ("id", "text", "subject", "entity", "applies_to",
+                                          "created_at", "event_start_at", "evidence_kind", "retention_class")}
+
+
+def _old_fact_material(rows):
+    return "\n\n相关旧事实（只用于比较）：\n" + json.dumps(
+        [_old_fact_view(row) for row in rows.values()], ensure_ascii=False,
+    )
+
+
+def _valid_operation(row):
+    op = row.get("operation")
+    target = row.get("target_id")
+    text = row.get("text")
+    reason = row.get("retention_reason")
+    return (isinstance(text, str) and bool(text.strip())
+            and isinstance(reason, str) and bool(reason.strip())
+            and row.get("retention_class") in RETENTION_CLASSES
+            and ((op == "add" and target in (None, ""))
+                 or (op in ("confirm", "correct") and isinstance(target, str) and bool(target.strip()))))
+
+
+def _structured_experience(character, messages, keys):
+    # The structured plugin event carries one sourced result, not a chat exchange.
+    source = parse_source_key(keys[0]) if len(keys) == 1 else None
+    return (source and source["kind"] == "plugin" and source["character"] == character
+            and len(messages) == 1 and metadata_of(messages[0]).get("structured_experience") is True
+            and bool(message_text(messages[0]).strip()))
+
+
+def _refresh_confirmation(row):
+    confirmed = confirmation_time(row)
+    if confirmed is not None:
+        row["last_confirmed_at"] = confirmed.isoformat()
+        row["confirmation_basis"] = "user"
+
+
 def _shared_experience_candidate(messages: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     text = message_text(messages[-1]) if messages else ""
     return {"text": text, "importance": 5, "source": "shared_experience", "entity": "relationship",
             "message_refs": [metadata_of(message)["message_ref"] for message in messages],
-            "evidence_kind": "observed_action"}
+            "evidence_kind": "observed_action", "operation": "add",
+            "retention_class": "normal", "_structured_experience": True}
 
 
 def _build_prompt(
@@ -1700,29 +1958,10 @@ def _build_prompt(
         for message in context if message_text(message).strip()
     )
     return (
-        FIRST_PERSON_VOICE
-        + "我整理本轮互动里值得记住的事情：对方告诉我的信息、我的表达与选择、"
-        "共同约定、共同经历的过程和结果，以及正在延续的话题。\n"
-        "我结合前文理解指代和省略，确定具体的人物、对象与意思。"
-        "每条内容依据本轮实际说话者的表达和结果，前文承担理解背景的作用。"
-        "我选择意思清楚、具有具体内容的事实；对方明确表达的长期喜好、习惯和约定进入长期记忆。"
-        "临时操作、一次性尺寸调整、比较或生成指令保留为本次交流的情境。"
-        "我把这些具体内容整理成简洁的记忆。\n"
-        "我以自己的视角写 text，按 JSON 数组返回，元素为 "
-        '{"text": "我的第一人称记忆正文", "importance": 1-10, '
-        '"entity": "master|neko|relationship", "source": "user_observation|user_correction|ai_disclosure|shared_experience", '
-        '"sources": [1], "message_refs": ["消息引用字符串"]}。'
-        "entity 标记事情的主体：master 是对方、neko 是我、relationship 是双方关系或经历；"
-        "source 标记材料由谁提供：对方陈述用 user_observation，我自己的可见表达用 ai_disclosure，共同经历用 shared_experience。"
-        "sources 填整数轮次编号 1；message_refs 逐字填写对应消息 message_ref= 后的完整字符串。"
-        "我选择支持内容的具体消息引用；对方偏好取自对方陈述，我的愿望记为当时的表达。"
-        "event_when 是可选字段：对方明确提到事件时间时填写，其余情况省略或设为 null。"
-        "格式为 start/end 各为 null 或"
-        "包含 offset（相对本轮时间的整数）和 unit（minute/hour/day/week/month/year）"
-        "的对象；长期偏好的事件时间通常留空。\n"
+        FIRST_PERSON_VOICE + _FACT_ADMISSION
         + ("这些原话来自游戏中的交流，我在这里提取游戏之外的生活事实和通用相处偏好。"
            "混合表述采用其中生活或相处的部分。\n" if game_dialogue else "")
-        + "事实为空时返回 []。本次输出为 JSON。\n\n"
+        + "\n\n"
         f"前文（仅供指代消解）：\n{reference or '（无）'}\n\n本轮互动：\n{body}"
     )
 
@@ -1780,10 +2019,10 @@ def _parse_extraction(
     candidates: list[dict[str, Any]] = []
     for item in data[:limit]:
         if not isinstance(item, Mapping):
-            continue
+            return None
         candidate = dict(item)
-        if not str(candidate.get("text") or "").strip():
-            continue
+        if not _valid_operation(candidate):
+            return None
         candidates.append(candidate)
     return candidates, [dict(item) for item in updates[:8]], [
         dict(item) for item in signals[:limit] if isinstance(item, Mapping)

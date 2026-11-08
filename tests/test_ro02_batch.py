@@ -35,6 +35,7 @@ from rin_memory.adapters.composition import build_memory_core
 from rin_memory.contracts import DeletionRequest, Scope
 from rin_memory.domain.extraction import ExtractionSettings
 from rin_memory.domain.reflection import ReflectionSettings
+from test_b04_extraction import extraction_reply
 
 
 class MutableClock:
@@ -66,9 +67,9 @@ class BatchModel:
         reply = self._replies.pop(0) if self._replies else None
         if reply is None:
             return "[]" if purpose == "memory_fact_extraction" else "{}"
-        return reply if isinstance(reply, str) else json.dumps(
-            reply, ensure_ascii=False,
-        )
+        if purpose == "memory_fact_extraction":
+            return extraction_reply(reply, self.calls[-1])
+        return reply if isinstance(reply, str) else json.dumps(reply, ensure_ascii=False)
 
     @property
     def extraction_calls(self):

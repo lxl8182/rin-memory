@@ -259,10 +259,7 @@ class R03Tests(ServiceCase):
     def test_context_respects_subject(self):
         """The receipt and the recalled ids are bound to the caller's subject.
 
-        The assertion uses the ids returned by the context build rather than
-        the rendered block: passive recall has a calibrated threshold that
-        legitimately returns nothing for a short one-fact query (§6.2), so a
-        rendered-block assertion would test the threshold, not the boundary.
+        An exact match is visible only to the subject that owns the fact.
         """
         service = self.start(ScriptedModel())
         self._seed_scoped_facts(service)
@@ -291,7 +288,8 @@ class R03Tests(ServiceCase):
         self.assertIn("f_private", private_ids)
         self.assertNotIn("f_private", group_ids,
                          "the private fact leaked into another subject")
-        self.assertEqual(ids(private), set())  # threshold: documented, not a bug
+        self.assertIn("f_private", ids(private))
+        self.assertNotIn("f_private", ids(group))
 
     def test_game_scoped_fact_does_not_leak_into_the_host_scope(self):
         """A game-scoped fact is visible only when the query is in that scene."""

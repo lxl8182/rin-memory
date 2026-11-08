@@ -260,6 +260,33 @@ def _with_message_text(message: Mapping[str, Any], text: str) -> dict[str, Any]:
     return updated
 
 
+def merge_qq_reply_parts(message: dict[str, Any], source_key: str, parts: Mapping[int, str]) -> bool:
+    """Fill a QQ history placeholder with the bubbles accepted by the transport."""
+    if (message.get("type") != "ai" or _message_metadata(message).get("reply_transport") != "qq"
+            or source_key not in message_source_keys(message)):
+        return False
+    data = message["data"]
+    metadata = data["metadata"]
+    previous = metadata.get("qq_reply_parts") or {}
+    merged = dict(previous)
+    for index, text in parts.items():
+        existing = merged.setdefault(str(index), text)
+        if existing != text:
+            raise ValueError("QQ reply part changed at the same index")
+    if merged == previous:
+        return False
+    chunks = []
+    last = -1
+    for index, text in sorted((int(key), value) for key, value in merged.items()):
+        if chunks and index != last + 1:
+            chunks.append("\n")
+        chunks.append(text)
+        last = index
+    metadata["qq_reply_parts"] = merged
+    data["content"] = "".join(chunks).strip()
+    return True
+
+
 def _is_blank_file(path: Path) -> bool:
     """Whether the file exists and holds only whitespace.
 
@@ -384,6 +411,16 @@ class RecentStore:
                 character, path, payload, operation="append_recent",
             )
             return len(payload)
+
+    def add_qq_reply_parts(self, character: str, source_key: str, parts: Mapping[int, str]) -> None:
+        path = self._path(character)
+        with _lock_for(path):
+            rows = self._load_document(path)
+            changed = False
+            for row in rows:
+                changed = merge_qq_reply_parts(row, source_key, parts) or changed
+            if changed:
+                self._write_locked(character, path, rows, operation="qq_reply_parts")
 
     def replace(
         self, character: str, messages: Sequence[Mapping[str, Any]],

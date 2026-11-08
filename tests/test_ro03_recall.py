@@ -22,14 +22,17 @@ Contract under test:
 * one generation turn reuses one snapshot; the next turn sees the next version.
 """
 
+import asyncio
+import json
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from rin_memory.adapters.composition import build_memory_core
 from rin_memory.contracts import CorrectionRequest, DeletionRequest, DeletionTarget, Scope
 from rin_memory.domain.extraction import ExtractionSettings
+from rin_memory.domain.recall import RecallSettings, bm25_scores
 
 CHARACTER = "demo"
 
@@ -60,18 +63,35 @@ def fact(fact_id, text, *, importance=5, keys=None, subject="private"):
     }
 
 
+class SelectionModel:
+    def __init__(self):
+        self.calls = []
+        self.answer = None
+
+    async def invoke(self, tier, messages, **kwargs):
+        material = json.loads(messages[-1]["content"])
+        self.calls.append((tier, kwargs, material))
+        if self.answer is not None:
+            return await self.answer(material)
+        return json.dumps({"selected": [
+            {"key": row["key"], "use": "当前问题需要这一条"}
+            for row in material["candidates"][:3]
+        ]})
+
+
 class RecallHarness(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         self.clock = FixedClock()
+        self.model = SelectionModel()
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
     def build(self, name="memory"):
         core = build_memory_core(
-            memory_root=self.root / name, clock=self.clock,
+            memory_root=self.root / name, clock=self.clock, model=self.model,
             extraction_settings=ExtractionSettings(inline=False),
         )
         core.recover(CHARACTER)
@@ -95,6 +115,28 @@ class RecallHarness(unittest.IsolatedAsyncioTestCase):
 
 class ImageAndSmallTalkTurn(RecallHarness):
     """A turn with no usable words must not inherit the important facts."""
+
+    async def test_original_dialogue_is_available_by_date_in_fast_chat(self):
+        core = build_memory_core(
+            memory_root=self.root / "history", clock=self.clock, model=self.model,
+            extraction_settings=ExtractionSettings(inline=False),
+            recall_settings=RecallSettings(fast_chat=True),
+        )
+        key = "host:demo:private:archive"
+        await core.extraction.ingest_turn(
+            CHARACTER, [{"type": "human", "data": {"content": "蓝雀码头沿哪条路过去？"}}],
+            source_key=key, session_id="old",
+        )
+        recall = await core.recall.build_turn_context(
+            CHARACTER, current_input="2026年10月22日那天说了什么？", budget_ms=1000,
+        )
+        self.assertIn("蓝雀码头", recall["context"])
+        self.assertEqual(recall["source_ids"], [key])
+        self.assertEqual(self.model.calls, [])
+        friend = await core.recall.recall_by_time(
+            CHARACTER, time_range="2026-10-22", subject="qq-friend:42",
+        )
+        self.assertEqual(friend["items"], [])
 
     async def test_a_plain_picture_turn_carries_no_facts(self):
         core = self.build()
@@ -127,8 +169,7 @@ class ImageAndSmallTalkTurn(RecallHarness):
         self.assertEqual([item["id"] for item in items], ["fact_server"])
         self.assertIn("服务器", asked["working_summary"]["sections"]
                       ["important_facts"]["block"])
-        # The reason a row was offered is reported, so a reader can audit it.
-        self.assertTrue(items[0]["matched_terms"])
+        self.assertEqual(asked["selection"]["items"][0]["key"], "fact:fact_server")
 
     async def test_an_unrelated_topic_gets_no_facts_even_with_many_stored(self):
         core = self.build()
@@ -163,6 +204,12 @@ class SelectionLimits(RecallHarness):
         ids = {item["id"] for item in items}
         self.assertNotIn("fact_e", ids, "无关的高重要度事实不得挤进上下文")
         self.assertTrue(ids & {"fact_a", "fact_b", "fact_c", "fact_d"})
+        noise = fact("fact_noise", "今天" + "仓储航运装卸机具计划设计工厂设备" * 100)
+        query = "今天去公园参加马拉松需要带什么"
+        ranked = bm25_scores(query, [noise])
+        self.assertTrue(ranked)
+        self.assertEqual(core.recall._passive_pick(query, ranked, [], (), "chat")[0], [])
+
 
     async def test_the_seed_closes_over_scope_and_validity(self):
         core = self.build()
@@ -195,6 +242,18 @@ class ConstraintsOutrankTheLimit(RecallHarness):
         self.assertEqual(self.sections(context), [])
         self.assertIn("绿茶", context["corrections"]["block"])
 
+        async def slow(_):
+            await asyncio.sleep(1)
+            self.fail("selector must be cancelled at the request deadline")
+
+        self.model.answer = slow
+        timed = await core.recall.build_turn_context(
+            CHARACTER, current_input="那台服务器", budget_ms=150,
+        )
+        self.assertEqual(timed["selection"]["status"], "timed_out")
+        self.assertEqual(timed["memory_ids"], [])
+        self.assertIn("绿茶", timed["corrections"]["block"])
+
     async def test_a_deleted_fact_never_comes_back_for_a_matching_turn(self):
         core = self.build()
         self.seed(core)
@@ -207,6 +266,71 @@ class ConstraintsOutrankTheLimit(RecallHarness):
         )
         self.assertEqual(self.sections(context), [],
                          "删除后即使用户问到也不能召回")
+
+
+    async def test_selection_distinguishes_empty_failure_and_deletion_during_call(self):
+        core = self.build()
+        self.seed(core)
+        zero = await core.recall.build_turn_context(CHARACTER, current_input="")
+        self.assertEqual(zero["selection"]["status"], "empty")
+        self.assertEqual(self.model.calls, [])
+
+        async def reject(_):
+            return '{"selected":[]}'
+
+        self.model.answer = reject
+        empty = await core.recall.build_turn_context(CHARACTER, current_input="服务器怎么样")
+        self.assertEqual(empty["selection"]["status"], "empty")
+        self.assertEqual(len(self.model.calls), 1)
+
+        async def invalid(_):
+            return '{"selected":[{"key":"fact:unknown","use":"use"}]}'
+
+        self.model.answer = invalid
+        failed = await core.recall.build_turn_context(CHARACTER, current_input="服务器怎么样")
+        self.assertEqual(failed["selection"]["status"], "invalid_output")
+        self.assertFalse(failed["context"])
+
+        async def delete(material):
+            await core.deletion_service.forget(DeletionRequest(
+                scope=Scope(CHARACTER), targets=(DeletionTarget("fact", "fact_server"),),
+            ))
+            return json.dumps({"selected": [{"key": material["candidates"][0]["key"], "use": "续接"}]})
+
+        self.model.answer = delete
+        late = await core.recall.build_turn_context(CHARACTER, current_input="服务器怎么样")
+        self.assertEqual(late["selection"]["status"], "superseded")
+        self.assertEqual(late["memory_ids"], [])
+        self.assertEqual(self.sections(late), [])
+
+
+    async def test_fading_is_shared_and_old_experience_can_be_recalled(self):
+        core = self.build()
+        self.seed(core)
+        past = (self.clock.now() - timedelta(days=500)).isoformat()
+        current = self.clock.now().isoformat()
+        old = dict(fact("fact_old", "第一次一起参加马拉松，我和主人领到了奖牌", importance=5),
+                   source="shared_experience", retention_class="daily", created_at=past,
+                   updated_at=current, last_confirmed_at=current, recent_mentions=[current])
+        durable = dict(fact("fact_limit", "主人一直需要无麸质食物", importance=5),
+                       retention_class="durable", created_at=past)
+        core.facts.save(CHARACTER, [old, durable])
+        ordinary = await core.recall.build_turn_context(CHARACTER, current_input="马拉松怎么报名")
+        self.assertEqual(ordinary["memory_ids"], [])
+        self.assertNotIn("奖牌", str(ordinary["working_summary"]))
+        self.assertEqual(self.model.calls, [])
+        history = await core.recall.build_turn_context(CHARACTER, current_input="还记得第一次参加马拉松吗")
+        self.assertEqual(history["memory_ids"], ["fact_old"])
+        self.assertEqual(history["selection"]["items"][0]["fading_factor"], 0.05)
+        stable = await core.recall.build_turn_context(CHARACTER, current_input="选无麸质食物")
+        self.assertEqual(stable["memory_ids"], ["fact_limit"])
+        confirmed = dict(old, source_bindings=[{
+            "role": "user", "evidence_kind": "user_assertion", "occurred_at": current,
+            "source_key": old["source_event_keys"][0],
+        }])
+        core.facts.save(CHARACTER, [confirmed, durable])
+        refreshed = await core.recall.build_turn_context(CHARACTER, current_input="马拉松怎么报名")
+        self.assertEqual(refreshed["selection"]["items"][0]["fading_factor"], 1.0)
 
 
 class AdministrativeViewIsUnchanged(RecallHarness):

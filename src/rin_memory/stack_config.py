@@ -274,12 +274,14 @@ def load_config(path: Path | str) -> StackConfig:
             raise StackConfigError(
                 f"clients.{client}.trusted_plugins: expected a list of plugin ids",
             )
+    if not isinstance(cfg.get("memory_enabled", True), bool):
+        raise StackConfigError("service.memory_enabled: expected a boolean")
     settings = ServiceSettings(
         memory_root=roots["memory"], local_state_root=roots["state"] / "memory-service",
         character=character_id, host=host, port=port,
         maintenance_interval_s=_number(cfg, "maintenance_interval_s", 60),
         chat_timeout_s=_number(cfg, "chat_timeout_s", 60),
-        context_budget_ms=_number(cfg, "context_budget_ms", 1000, integer=True),
+        context_budget_ms=_number(cfg, "context_budget_ms", 9000, integer=True),
         max_body_bytes=_number(cfg, "max_body_bytes", 2 * 1024 * 1024, integer=True),
         max_in_flight_chat=_number(cfg, "max_in_flight_chat", 4, integer=True),
         shutdown_timeout_s=_number(cfg, "shutdown_timeout_s", 30),
@@ -292,6 +294,7 @@ def load_config(path: Path | str) -> StackConfig:
         batch_idle_seconds=_nonnegative_number(cfg, "batch_idle_seconds", 120),
         batch_max_turns=_number(cfg, "batch_max_turns", 5, integer=True),
         batch_max_messages=_number(cfg, "batch_max_messages", 16, integer=True),
+        memory_enabled=cfg.get("memory_enabled", True),
         model=ModelSettings(
             base_url=base_url, api_key_env=key_env, models=tiers,
             timeout_s=_number(cfg, "model_timeout_s", 60),
@@ -347,7 +350,7 @@ subject = 'private'
 [service]
 host = '127.0.0.1'
 port = 48931
-context_budget_ms = 1000
+context_budget_ms = 9000
 chat_timeout_s = 60
 model_timeout_s = 60
 model_concurrency = 4
@@ -358,6 +361,8 @@ max_body_bytes = 2097152
 startup_timeout_s = 20
 shutdown_timeout_s = 30
 maintenance_interval_s = 60
+# 暂停长期记忆提取、召回和后台加工；人格与普通聊天继续工作，已有数据保留。
+memory_enabled = true
 
 # RO02 成本优化开关（不是可选项）：普通提取合批。同一作用域积累 5 轮，或
 # 最后一次用户发言后空闲 batch_idle_seconds 秒，满足其一即处理；0 表示每个

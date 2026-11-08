@@ -17,7 +17,6 @@ triple; callers capture \`version()\` before their work and compare after it.
 from __future__ import annotations
 
 import asyncio
-import threading
 from typing import Any, Callable, Mapping, Sequence
 
 from ..contracts import (
@@ -71,8 +70,6 @@ class CorrectionService:
         self._permit = permit
         self._derived_invalidators = tuple(derived_invalidators)
         self._token_counter = token_counter
-        self._locks: dict[str, threading.RLock] = {}
-        self._locks_guard = threading.Lock()
         journal.register_handler(CORRECTION_EVENT_TYPE, corrections.replay_snapshot)
 
     # -- public API ------------------------------------------------------
@@ -80,6 +77,29 @@ class CorrectionService:
     async def correct(self, request: CorrectionRequest) -> CorrectionReceipt:
         """Record a preference/fact correction and invalidate what it replaces."""
         return await asyncio.to_thread(self._correct_sync, request)
+
+    def correct_extracted(self, request: CorrectionRequest) -> CorrectionReceipt:
+        """Apply a source-bound extraction operation under the commit fence."""
+        return self._correct_sync(request, operation_id="corr_" + request.request_id)
+
+    def extracted(self, character, source_keys, *, subject, repair=False):
+        """Previously journaled extraction corrections from these utterances."""
+        keys = set(source_keys)
+        rows = [row for row in self.active(character, subject=subject)["items"]
+                if row.get("source_key") in keys and row["correction_id"].startswith("corr_extract_")]
+        if repair:
+            for row in rows:
+                if self._needs_propagation(row):
+                    self._propagate(character, row, duplicate=True)
+        return rows
+
+    def repair_replacements(self, character: str) -> None:
+        with self._barrier.write_lock(character):
+            for entry in self._corrections.all_entries(character):
+                if (entry.get("status") == STATUS_ACTIVE and self._can_materialize(entry)
+                        and not entry.get("replacement_fact_id")
+                        and not self._barrier.blocks_correction_entry(character, entry)):
+                    self._propagate(character, entry, duplicate=True)
 
     async def retract(self, character: str, correction_id: str) -> CorrectionReceipt:
         """Withdraw an active correction (applied invalidations are kept)."""
@@ -100,6 +120,10 @@ class CorrectionService:
         """Correction prompt block with deleted content filtered out."""
         active = self._corrections.active(character, subject=subject, scene=scene)
         items = self._barrier.filter_correction_entries(character, active["items"])
+        if any(item.get("replacement_fact_id") for item in items):
+            invalidated = {row.get("id") for row in self._facts.load(character) + self._facts.load_archive(character)
+                           if row.get(FACT_INVALIDATED_AT)}
+            items = [item for item in items if item.get("replacement_fact_id") not in invalidated]
         return MemoryBlock(
             block=render_block(
                 items, language, limit_tokens, counter=self._token_counter,
@@ -128,10 +152,14 @@ class CorrectionService:
 
     # -- write flow ------------------------------------------------------
 
-    def _correct_sync(self, request: CorrectionRequest) -> CorrectionReceipt:
+    def _correct_sync(
+        self, request: CorrectionRequest, *, operation_id: str = "",
+    ) -> CorrectionReceipt:
         character = request.scope.character
         spec = self._spec_from_request(request)
-        with self._lock(character):
+        if operation_id:
+            spec["operation_id"] = operation_id
+        with self._barrier.write_lock(character):
             prepared = self._corrections.prepare(character, spec)
             if prepared.duplicate:
                 receipt = self._receipt_from_entry(
@@ -140,7 +168,7 @@ class CorrectionService:
                     duplicate=True,
                     request_id=request.request_id,
                 )
-                if not self._has_derived(prepared.entry):
+                if self._needs_propagation(prepared.entry):
                     # Repair window: a crash between the journal append and
                     # propagation leaves an active entry with empty derived
                     # ids; re-running propagation is idempotent.
@@ -167,14 +195,20 @@ class CorrectionService:
             )
 
     def _retract_sync(self, character: str, correction_id: str) -> CorrectionReceipt:
-        with self._lock(character):
-            outcome = self._corrections.retract(character, correction_id)
-            self._barrier.invalidate(character)
+        with self._barrier.write_lock(character):
             entry = self._corrections.get(character, correction_id)
             if entry is None:
                 raise CorrectionNotFoundError(
                     f"unknown correction {correction_id!r}",
                 )
+            if entry.get("status") == STATUS_ACTIVE and entry.get("replacement_fact_id"):
+                self._invalidate_facts(character, {
+                    "correction_id": correction_id,
+                    "target_fact_ids": [entry["replacement_fact_id"]],
+                }, reason="correction_retracted")
+            outcome = self._corrections.retract(character, correction_id)
+            self._barrier.invalidate(character)
+            entry = self._corrections.get(character, correction_id) or entry
             return self._receipt_from_entry(
                 entry,
                 int(outcome.get("version") or 0),
@@ -193,6 +227,7 @@ class CorrectionService:
         correction_id = str(entry.get("correction_id") or "")
         derived = {"fact_ids": [], "reflection_ids": [], "persona_ids": []}
         invalidated_source_keys: list[str] = []
+        replacement = None
         if entry.get("kind") == KIND_FACT_CORRECTION:
             invalidated, source_keys = self._invalidate_facts(character, entry)
             derived["fact_ids"] = invalidated
@@ -205,11 +240,14 @@ class CorrectionService:
                     for name in ("reflection_ids", "persona_ids"):
                         values = outcome.get(name) or ()
                         derived[name] = _merge_ids(derived[name], values)
+            if self._can_materialize(entry):
+                replacement = self._materialize(character, entry, invalidated)
         self._corrections.set_derived(
             character,
             correction_id,
             derived=derived,
             invalidated_source_keys=invalidated_source_keys,
+            replacement_fact_id=replacement,
         )
         stored = self._corrections.get(character, correction_id) or dict(entry)
         return self._receipt_from_entry(
@@ -217,8 +255,63 @@ class CorrectionService:
             duplicate=duplicate, request_id=request_id,
         )
 
+    @staticmethod
+    def _can_materialize(entry: Mapping[str, Any]) -> bool:
+        return bool(entry.get("kind") == KIND_FACT_CORRECTION and entry.get("text")
+                    and entry.get("action") != ACTION_RETRACT and not entry.get("expires_at"))
+
+    def _needs_propagation(self, entry: Mapping[str, Any]) -> bool:
+        return (not self._has_derived(entry)
+                or self._can_materialize(entry) and not entry.get("replacement_fact_id"))
+
+    def _materialize(self, character: str, entry: Mapping[str, Any], invalidated: Sequence[str]) -> str | None:
+        replacement_id = "fact_" + entry["correction_id"]
+        active = self._facts.load(character)
+        archive = self._facts.load_archive(character)
+        previous = active + archive
+        if self._barrier.blocks_correction_entry(character, entry):
+            return None
+        existing = next((row for row in previous if row.get("id") == replacement_id), None)
+        if existing is not None:
+            if existing.get(FACT_INVALIDATED_REASON) == "correction_retracted":
+                for field in (FACT_INVALIDATED_AT, FACT_INVALIDATED_BY, FACT_INVALIDATED_REASON):
+                    existing.pop(field, None)
+                self._facts.commit(character, active=active, archive=archive)
+            return replacement_id
+        target_ids = set(entry.get("target_fact_ids") or ()) | set(invalidated)
+        targets = [row for row in previous if row.get("id") in target_ids]
+        for target in targets:
+            target_ids.update(target.get("correction_target_ids") or ())
+        source = entry.get("source_key")
+        keys = [source] if source else []
+        text = entry["text"]
+        created = entry.get("created_at") or self._clock.now().isoformat()
+        row = {
+            "id": replacement_id,
+            "text": text,
+            "importance": max((target["importance"] for target in targets
+                               if isinstance(target.get("importance"), int)), default=5),
+            "entity": next((target["entity"] for target in targets if target.get("entity")), "master"),
+            "subject": entry["subject"],
+            "applies_to": dict(entry.get("applies_to") or {}),
+            "created_at": created,
+            "retention_class": "durable",
+            "schema_version": 2,
+            "source": "user_correction",
+            "evidence_kind": "user_assertion",
+            "source_event_keys": keys,
+            "support_groups": [keys] if keys else [],
+            "correction_target_ids": sorted(target_ids),
+            "absorbed": True,
+            "signal_processed": True,
+        }
+        if self._barrier.blocks_row(character, row):
+            return None
+        self._facts.save(character, active + [row])
+        return replacement_id
+
     def _invalidate_facts(
-        self, character: str, entry: Mapping[str, Any],
+        self, character: str, entry: Mapping[str, Any], *, reason: str = "user_correction",
     ) -> tuple[list[str], list[str]]:
         """Mark matching facts/archive rows invalidated; return ids and sources."""
         target_ids = {
@@ -257,27 +350,29 @@ class CorrectionService:
                     hit = True
             if not hit:
                 return False
-            row[FACT_INVALIDATED_AT] = now
-            row[FACT_INVALIDATED_BY] = str(entry.get("correction_id") or "")
-            row[FACT_INVALIDATED_REASON] = "user_correction"
-            row["signal_processed"] = True
-            history = row.get("version_history")
-            if not isinstance(history, list):
-                history = []
-            history.append({
-                "text": str(row.get("text") or "")[:600],
-                "replaced_at": now,
-                "reason": "user_correction",
-                "source_fact_id": None,
-            })
-            row["version_history"] = history[-8:]
+            changed = row.get(FACT_INVALIDATED_BY) != entry.get("correction_id")
+            if changed:
+                row[FACT_INVALIDATED_AT] = now
+                row[FACT_INVALIDATED_BY] = str(entry.get("correction_id") or "")
+                row[FACT_INVALIDATED_REASON] = reason
+                row["signal_processed"] = True
+                history = row.get("version_history")
+                if not isinstance(history, list):
+                    history = []
+                history.append({
+                    "text": str(row.get("text") or "")[:600],
+                    "replaced_at": now,
+                    "reason": "user_correction",
+                    "source_fact_id": None,
+                })
+                row["version_history"] = history[-8:]
             row_id_text = row.get("id")
             if isinstance(row_id_text, str) and row_id_text and row_id_text not in invalidated_ids:
                 invalidated_ids.append(row_id_text)
             for key in row.get("source_event_keys") or ():
                 if isinstance(key, str) and key and key not in invalidated_keys:
                     invalidated_keys.append(key)
-            return True
+            return changed
 
         for row in active:
             if _mark(row):
@@ -382,14 +477,6 @@ class CorrectionService:
             replacement_fact_id=entry.get("replacement_fact_id"),
             request_id=request_id,
         )
-
-    def _lock(self, character: str) -> threading.RLock:
-        with self._locks_guard:
-            lock = self._locks.get(character)
-            if lock is None:
-                lock = threading.RLock()
-                self._locks[character] = lock
-            return lock
 
 
 def _scene_matches_fact(row: Mapping[str, Any], correction_scene: Any) -> bool:

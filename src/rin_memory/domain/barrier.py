@@ -205,6 +205,15 @@ class DeletionBarrier:
         self._corrections = corrections
         self._states: dict[str, BarrierState] = {}
         self._guard = threading.Lock()
+        self._write_locks: dict[str, threading.RLock] = {}
+
+    def write_lock(self, character: str) -> threading.RLock:
+        """Serialize extraction, correction and deletion commits for one character."""
+        with self._guard:
+            lock = self._write_locks.get(character)
+            if lock is None:
+                lock = self._write_locks[character] = threading.RLock()
+            return lock
 
     # -- state -----------------------------------------------------------
 
@@ -341,6 +350,8 @@ class DeletionBarrier:
         if isinstance(row_id, str) and row_id:
             if index.blocks_target(_infer_row_type(row), row_id):
                 return True
+        if any(index.blocks_target("fact", fact_id) for fact_id in row.get("correction_target_ids") or ()):
+            return True
         for key in self._source_keys_of(row):
             if key in index.source_keys:
                 return True
@@ -379,6 +390,15 @@ class DeletionBarrier:
             return True
         return False
 
+    def history_blocked_sources(self, character: str) -> set[str]:
+        """Sources behind explicitly forgotten facts stay out of history recall."""
+        return {
+            key
+            for record in self._deletions.load_view(character).get("deletions", ())
+            if any(target.get("type") == "fact" or target.get("text_hash") for target in record.get("targets", ()))
+            for key in record.get("plugin_source_keys", ())
+        }
+
     def filter_messages(self, character: str, messages: Any) -> list[dict[str, Any]]:
         """Drop deleted messages from a read/write window, keeping the order."""
         return [
@@ -407,6 +427,10 @@ class DeletionBarrier:
         if not isinstance(entry, Mapping):
             return True
         index = self.state(character).index
+        if entry.get("source_key") in index.source_keys:
+            return True
+        if index.blocks_target("fact", entry.get("replacement_fact_id")):
+            return True
         for field_name in ("text", "replaces_text"):
             value = entry.get(field_name)
             if isinstance(value, str) and value.strip():

@@ -169,6 +169,7 @@ class MaintenanceService:
         self._proactive_subject = str(proactive_subject or "private")
         self._tasks: dict[str, asyncio.Task[Any]] = {}
         self._stops: dict[str, asyncio.Event] = {}
+        self._wakes: dict[str, asyncio.Event] = {}
         self._last: dict[str, MaintenanceResult] = {}
 
     @property
@@ -541,13 +542,21 @@ class MaintenanceService:
             self._tasks.pop(name, None)
             self._stops.pop(name, None)
         stop_event = asyncio.Event()
+        wake_event = asyncio.Event()
         task = asyncio.create_task(
-            self._loop(name, interval, max_rounds, stop_event),
+            self._loop(name, interval, max_rounds, stop_event, wake_event),
             name=f"rin-memory-maintenance:{name}",
         )
         self._tasks[name] = task
         self._stops[name] = stop_event
+        self._wakes[name] = wake_event
         return task
+
+    def wake(self, character: str) -> None:
+        task = self._tasks.get(character)
+        event = self._wakes.get(character)
+        if task is not None and not task.done() and event is not None:
+            task.get_loop().call_soon_threadsafe(event.set)
 
     async def _loop(
         self,
@@ -555,10 +564,12 @@ class MaintenanceService:
         interval: float,
         max_rounds: int | None,
         stop_event: asyncio.Event,
+        wake_event: asyncio.Event,
     ) -> None:
         rounds = 0
         try:
             while not stop_event.is_set():
+                wake_event.clear()
                 if max_rounds is not None and rounds >= max_rounds:
                     break
                 try:
@@ -572,7 +583,7 @@ class MaintenanceService:
                 if max_rounds is not None and rounds >= max_rounds:
                     break
                 try:
-                    await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                    await asyncio.wait_for(wake_event.wait(), timeout=interval)
                 except asyncio.TimeoutError:
                     continue
         except asyncio.CancelledError:
@@ -590,6 +601,7 @@ class MaintenanceService:
             stop_event = self._stops.get(name)
             if stop_event is not None:
                 stop_event.set()
+                self._wakes[name].set()
             task = self._tasks.get(name)
             if task is not None:
                 try:
@@ -600,6 +612,7 @@ class MaintenanceService:
                     pass
             self._tasks.pop(name, None)
             self._stops.pop(name, None)
+            self._wakes.pop(name, None)
 
     def running(self, character: Any = None) -> bool:
         if character is None:

@@ -387,7 +387,7 @@ class FollowupResolutionTests(M5Base):
         self.assertEqual(context["followup"]["status"], "resolved")
         self.assertIn("准备面试", context["followup"]["thread"]["text"])
         self.assertEqual(context["companion_state_version"], 1)
-        self.assertIn("准备面试", context["companion_state"]["block"])
+        self.assertIn("准备面试", context["context"])
         # The continuation actually reaches the right experience, not just the
         # right thread: the episode of the resolved item is the anchor.
         self.assertEqual(context["result"], "matched", context["query_meta"])
@@ -470,12 +470,9 @@ class RealStateTests(M5Base):
         )
         self.assertEqual(context["companion_state_version"], 1)
         state = context["companion_state"]
-        self.assertTrue(state["block"])
         self.assertEqual(state["version"], 1)
-        self.assertTrue(state["items"])
-        self.assertEqual(
-            [item["type"] for item in state["items"]], ["progress"],
-        )
+        self.assertEqual(state["items"], [])
+        self.assertEqual(state["block"], "")
 
     async def test_state_block_and_version_come_from_one_read(self):
         core = self.build()
@@ -487,7 +484,8 @@ class RealStateTests(M5Base):
         version = context["companion_state_version"]
         live = core.state_service.read("rin", subject="private")
         self.assertEqual(version, live.version)
-        self.assertEqual(context["companion_state"]["block"], live.block)
+        self.assertIn("准备面试", live.block)
+        self.assertEqual(context["companion_state"]["block"], "")
 
     async def test_no_state_degrades_to_the_documented_empty_shape(self):
         core = self.build()
@@ -777,7 +775,8 @@ class ContextLayersTests(M5Base):
         self.assertIsNotNone(payload["working_summary"])
         self.assertIn("sections", payload["working_summary"])
         self.assertEqual(payload["state_version"], 1)
-        self.assertTrue(payload["state"]["block"])
+        self.assertEqual(payload["state"]["block"], "")
+        self.assertIn("准备面试", payload["context"]["context"])
         self.assertEqual(payload["threads_source"], "companion_state")
         self.assertEqual(payload["episode"]["episode_id"], "ep:host:interview")
         self.assertEqual(payload["working_summary"]["episode"]["episode_id"],

@@ -12,8 +12,10 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from test_b04_extraction import extraction_reply
+
 from rin_memory.adapters.model_http import ModelCallError
-from rin_memory.contracts import DeletionRequest, DeletionTarget, Scene, Scope
+from rin_memory.contracts import CorrectionRequest, DeletionRequest, DeletionTarget, Scene, Scope
 from rin_memory.service.management import ManagementApi
 from rin_memory.service.memory_service import MemoryService, ServiceSettings
 from rin_memory.service.server import MemoryApi, build_server
@@ -34,7 +36,11 @@ class Model:
         purpose = kwargs["purpose"]
         self.calls.append((purpose, messages))
         if purpose == "memory_fact_extraction":
-            return json.dumps([{"text": "用户喜欢乌龙茶", "importance": 7, "entity": "master"}], ensure_ascii=False)
+            return extraction_reply([{"text": "用户喜欢乌龙茶", "importance": 7, "entity": "master", "sources": [1]}],
+                                    messages[0]["content"])
+        if purpose == "memory_recall_selection":
+            data = json.loads(messages[-1]["content"])
+            return json.dumps({"selected": [{"key": item["key"], "use": "偏好"} for item in data["candidates"][:3]]})
         if purpose == "persona_evolution_proposal":
             count = sum(call[0] == purpose for call in self.calls)
             return json.dumps({"operations": [{"op": "replace", "section_id": "tone", "text": "先给结论，再给具体理由。" + "嗯。" * count}],
@@ -59,13 +65,15 @@ class ServiceCloseoutTests(unittest.TestCase):
         self.env.start()
         self.start()
 
-    def start(self):
+    def start(self, *, memory_enabled=True, context_budget_ms=9000):
         self.service = MemoryService.start(ServiceSettings(
             memory_root=self.root, character="test", require_published_persona=True,
+            memory_enabled=memory_enabled,
+            context_budget_ms=context_budget_ms,
             clients={"plugin": {"token_env": "TEST_PLUGIN_TOKEN", "subjects": ["private"], "plugin_id": "game_test"}},
         ))
         self.service.model = self.model
-        for name in ("extraction", "compression", "evolution_service", "reflection_service"):
+        for name in ("extraction", "compression", "evolution_service", "reflection_service", "recall"):
             getattr(self.service.core, name)._model = self.model
         self.management = ManagementApi(self.service)
         self.api = MemoryApi(self.service)
@@ -114,6 +122,185 @@ class ServiceCloseoutTests(unittest.TestCase):
                 "messages": [{"role": "user", "content": "我喜欢乌龙茶"}],
                 "session_id": "session", **kwargs}
 
+    def test_qq_history_accumulates_only_confirmed_bubbles(self):
+        self.initialize()
+        scope = {"scene": "plugin:game_test", "session_id": "old"}
+        plugin = {"client": "plugin", "token": "test-plugin"}
+        first, last = "第一条：潮桥路线。", "第二条：银杉站。"
+        turn = self.body("qq-reply", **scope, source_key="plugin:game_test:test:private:old:qq-reply",
+                         reply=first + last, reply_transport="qq")
+        self.ok("/v1/turns", turn, **plugin)
+
+        def recent():
+            context = self.ok("/v1/context", scope, **plugin)
+            return [row["data"]["content"] for row in context["recent_turns"] if row["type"] == "ai"]
+
+        def accept(index, text):
+            body = {**scope, "request_id": "qq-reply", "receipt_id": f"qq-{index}", "kind": "sent",
+                    "transport": "qq_napcat", "parts": [{"index": index, "chars": len(text), "text": text}]}
+            self.assertNotIn("text", self.ok("/v1/receipts", body, **plugin)["parts"][0])
+
+        def historical(text):
+            return asyncio.run(self.service.core.recall.recall_memory(
+                "test", text, scene=Scene(plugin_id="game_test"),
+            ))["items"]
+
+        self.assertEqual(recent(), [])
+        self.assertEqual(historical("银杉站"), [])
+        accept(0, first)
+        self.assertEqual(recent(), [first])
+        self.assertEqual(historical("银杉站"), [])
+        accept(1, last)
+        accept(1, last)
+        self.assertEqual(recent(), [first + last])
+        self.assertIn(last, historical("银杉站")[0]["text"])
+        self.assertEqual(self.ok("/v1/turns", turn, **plugin)["reply"], first + last)
+
+    def test_public_qq_persona_is_separate_and_console_editable(self):
+        self.initialize()
+        plugin = {"client": "plugin", "token": "test-plugin"}
+        self.assertEqual(self.ok("/v1/qq/persona", **plugin), {"text": "", "revision": 0})
+        edit = {"text": "我是铃芽，和朋友用短句聊天。", "base_revision": 0}
+        self.assertEqual(self.request("/v1/qq/persona", edit, **plugin)[0], 403)
+        self.assertEqual(self.ok("/v1/qq/persona", edit)["revision"], 1)
+        self.assertEqual(self.request("/v1/qq/persona", edit)[0], 409)
+        self.assertEqual(self.ok("/v1/qq/persona", **plugin)["text"], edit["text"])
+        self.assertNotIn(edit["text"], self.ok("/v1/context", {})["persona"])
+
+    def test_friend_short_followup_at_one_second_reuses_only_its_own_exchange(self):
+        self.close()
+        self.start(context_budget_ms=1000)
+        self.initialize()
+        self.service.settings.clients["plugin"]["subjects"].extend(("qq-friend:42", "qq-friend:43"))
+        plugin = {"client": "plugin", "token": "test-plugin"}
+        friend = {"subject": "qq-friend:42", "scene": "plugin:game_test", "session_id": "old"}
+        source = "plugin:game_test:test:qq-friend_42:old:tent"
+        old_exchange = {"source_key": source, "user": "露营要带帐篷", "reply": "帐篷我已经列进清单了。"}
+        self.ok("/v1/turns", self.body("tent", **friend, source_key=source,
+            messages=[{"role": "user", "content": old_exchange["user"]}], reply=old_exchange["reply"]), **plugin)
+        history = {"mode": "topic", "exchanges": [old_exchange]}
+
+        def sources(text, subject="qq-friend:42"):
+            context = self.ok("/v1/context", dict(friend, subject=subject, session_id="new", text=text,
+                segment_history=history), **plugin)
+            return context["context"].get("segment_sources", [])
+
+        for text in ("早安", "我们聊聊新游戏", "上次那个呢？"):
+            self.assertEqual(sources(text), [])
+        self.assertEqual(sources("帐篷呢？"), [source])
+        self.assertEqual(sources("帐篷呢？", "qq-friend:43"), [])
+        self.assertEqual(self.model.calls, [])
+
+    def test_qq_segment_replay_keeps_the_topic_and_honors_the_source_fence(self):
+        self.initialize()
+        plugin = {"client": "plugin", "token": "test-plugin"}
+        old = {"session_id": "old", "scene": "plugin:game_test"}
+        new = {**old, "session_id": "new"}
+        rows = []
+        for i in range(16):
+            key = f"plugin:game_test:test:private:old:exchange-{i}"
+            user = f"海边露营装备清单第{i}项" if i < 14 else f"番茄炒蛋第{i}步"
+            reply = f"海边露营装备清单已记第{i}项。" if i < 14 else "先切番茄。"
+            receipt = self.ok("/v1/context", old, **plugin)["context_receipt_id"]
+            self.ok("/v1/turns", self.body(f"exchange-{i}", **old,
+                source_key=key, context_receipt_id=receipt,
+                messages=[{"role": "user", "content": user}], reply=reply), **plugin)
+            rows.append({"source_key": key, "user": user, "reply": reply})
+        forged = dict(rows[0], source_key="plugin:game_test:test:private:old:never-saved")
+
+        calls = []
+
+        async def select(tier, messages, **kwargs):
+            self.assertEqual(kwargs["purpose"], "memory_recall_selection")
+            material = json.loads(messages[-1]["content"])
+            calls.append(material)
+            return json.dumps({"selected": [], "continuation": [
+                row["key"] for row in material.get("previous", [])
+                if "露营" in material["current"] and "露营" in row["user"]
+            ]})
+
+        self.service.core.recall._model.invoke = select
+
+        def replay(text, mode="topic", **scope):
+            request = {**new, **scope, "text": text,
+                       "segment_history": {"mode": mode, "exchanges": [*rows, forged]}}
+            return self.ok("/v1/context", request, **plugin)
+
+        self.assertFalse(replay("早安呀")["context"].get("segment_sources"))
+        self.assertFalse(calls)
+        self.assertFalse(replay("帮我查明天的班车")["context"].get("segment_sources"))
+        self.assertEqual(len(calls), 1)
+        same_topic = replay("继续聊海边露营装备清单")["context"]
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls[-1]["previous"]), 6)
+        self.assertEqual(same_topic["segment_sources"], [row["source_key"] for row in rows[:14]])
+        self.assertFalse(same_topic["segment_detail"])
+        self.assertTrue(replay("昨天露营装备清单具体有哪些？")["context"]["segment_detail"])
+
+        async def timeout(*args, **kwargs):
+            raise TimeoutError()
+
+        self.service.core.recall._model.invoke = timeout
+        self.assertEqual(replay("昨天露营装备清单具体有哪些？")["context"]["segment_sources"],
+                         [row["source_key"] for row in rows[:14]])
+        self.assertFalse(replay("上次那个呢？")["context"].get("segment_sources"))
+
+        all_sources = [row["source_key"] for row in rows]
+        warm = replay("接着来", mode="budget")
+        self.assertEqual(warm["context"]["segment_sources"], all_sources)
+        self.assertFalse(replay("接着来", mode="budget", scene="plugin:another")["context"].get("segment_sources"))
+        self.ok("/v1/context/reserve", dict(new, request_id="next",
+            context_receipt_id=warm["context_receipt_id"], consumer_refs={
+                "selection_version": 1, "memory_ids": [], "source_ids": [all_sources[0], forged["source_key"]],
+                "plugin_id": "game_test",
+            }), **plugin)
+        refs = self.service.core.consumer_refs.refs("test", plugin_id="game_test")
+        self.assertEqual(refs[-1]["source_ids"], all_sources[:1])
+        asyncio.run(self.service.core.correction_service.correct(CorrectionRequest(
+            scope=Scope("test", "private"), target_source_keys=(all_sources[1],),
+            old_text=rows[1]["user"], new_text="露营装备清单第 1 项已更换。",
+        )))
+        self.ok("/v1/cleanup/delete", {"source_key": all_sources[0], "request_id": "drop-exchange"})
+        self.assertEqual(replay("接着来", mode="budget")["context"]["segment_sources"], all_sources[2:])
+
+    def test_memory_pause_keeps_persona_chat_and_data_without_extracting_or_recalling(self):
+        self.initialize()
+        fact = {"id": "keep-fact", "text": "用户喜欢乌龙茶", "subject": "private",
+            "source_event_keys": ["host:test:private:old"], "importance": 8}
+        self.service.core.facts.save("test", [fact])
+        self.ok("/v1/turns", self.body("queued-before-pause", reply="好。"))
+        pending = len(self.service.core.outbox.pending("test"))
+        self.assertGreater(pending, 0)
+        self.close()
+        self.start(memory_enabled=False)
+        core = self.service.core
+        context = self.ok("/v1/context", {"text": "乌龙茶", "session_id": "session"})
+        self.assertFalse(context["memory_enabled"])
+        self.assertTrue(context["persona"])
+        self.assertTrue(context["persona_version"])
+        self.assertEqual(context["context"]["reason"], "memory_paused")
+        self.assertEqual(context["context"]["memory_ids"], [])
+        self.assertIsNone(context["working_summary"])
+        self.assertEqual(context["recent_turns"], [])
+        self.assertEqual(context["corrections"]["block"], "")
+        self.ok("/v1/turns", self.body("during-pause", context_receipt_id=context["context_receipt_id"], reply="正常聊天。"))
+        calls = len(self.model.calls)
+        self.assertEqual(asyncio.run(core.extraction.process_outbox("test")), ())
+        self.assertEqual(len(self.model.calls), calls)
+        self.assertEqual(len(core.outbox.pending("test")), pending)
+        self.assertEqual(core.facts.load("test"), [fact])
+        self.assertEqual(asyncio.run(core.recall.recall_memory("test", "乌龙茶"))["items"], [])
+        self.service.settings.clients["plugin"]["memory_tools"] = True
+        entries = self.ok("/v1/memory/entries?subject=private", client="plugin", token="test-plugin")
+        self.assertEqual(entries["items"], [])
+        self.assertEqual(entries["reason"], "memory_paused")
+        asyncio.run(self.service.start_background())
+        self.assertIsNone(self.service._maintenance_task)
+        self.close()
+        self.start()
+        self.assertTrue(self.ok("/v1/context", {"text": "乌龙茶"})["memory_enabled"])
+        self.assertEqual(self.service.core.facts.load("test"), [fact])
+
     def test_friend_memory_is_scoped_factual_and_stays_deleted_after_restart(self):
         self.initialize()
         friend = {"subject": "qq-friend:42", "session_id": "qq-friend-old", "scene": "plugin:game_test"}
@@ -131,16 +318,19 @@ class ServiceCloseoutTests(unittest.TestCase):
         calls = []
         async def extract(tier, messages, **kwargs):
             calls.append(messages[0]["content"])
-            return json.dumps({"facts": [{"text": "用户喜欢红茶", "importance": 8,
-                "utterance_indices": [1]}], "state_updates": [{"kind": "thread_open", "utterance_indices": [99]}],
-                "signals": [{"topic": "红茶", "utterance_indices": [1]}]}, ensure_ascii=False)
+            if kwargs["purpose"] == "memory_recall_selection":
+                offered = json.loads(messages[-1]["content"])["candidates"]
+                return json.dumps({"selected": [{"key": item["key"], "use": "茶饮偏好"} for item in offered[:3]]})
+            return extraction_reply({"facts": [{"text": "用户喜欢红茶", "importance": 8, "sources": [1]}],
+                "state_updates": [{"kind": "thread_open", "utterance_indices": [99]}],
+                "signals": [{"topic": "红茶", "utterance_indices": [1]}]}, messages[0]["content"])
         core = self.service.core
         core.extraction._model.invoke = extract
         core.extraction._settings = replace(core.extraction._settings, batch_max_turns=1, batch_idle_seconds=0)
         self.ok("/v1/context/reserve", dict(friend, request_id="friend-one",
             context_receipt_id=context["context_receipt_id"]), **plugin)
         body = self.body("friend-one", **friend,
-            source_key="plugin:game_test:test:qq-friend_42:old:one",
+            source_key="plugin:game_test:test:qq-friend_42:qq-friend-old:one",
             context_receipt_id=context["context_receipt_id"],
             messages=[{"role": "user", "content": "我喜欢红茶"}], reply="记住啦。")
         self.ok("/v1/turns", body, **plugin)
@@ -167,7 +357,41 @@ class ServiceCloseoutTests(unittest.TestCase):
         self.assertEqual(len(calls), before, "friend facts never enter global reflection")
         self.assertEqual(core.reflections.load("test"), [])
         new = dict(friend, session_id="qq-friend-new")
-        self.ok("/v1/context", dict(new, text="红茶"), **plugin)
+        served = self.ok("/v1/context", dict(new, text="红茶"), **plugin)
+        self.assertEqual(served["context"]["memory_ids"], [fact_id])
+        history = {"mode": "budget", "exchanges": [
+            {"source_key": body["source_key"], "user": "我喜欢红茶", "reply": "记住啦。"},
+        ]}
+        for subject, expected in (("qq-friend:42", [body["source_key"]]), ("qq-friend:43", []), ("private", [])):
+            if subject == "qq-friend:43":
+                self.service.settings.clients["plugin"]["subjects"].append(subject)
+            carried = self.ok("/v1/context", dict(new, subject=subject, text="接着聊", segment_history=history), **plugin)
+            self.assertEqual(carried["context"].get("segment_sources", []), expected)
+        for index, (ids, sources) in enumerate((
+            ([], []), ([fact_id, "unknown"], facts[0]["source_event_keys"]),
+        )):
+            self.ok("/v1/context/reserve", dict(new, request_id=f"ref-{index}",
+                context_receipt_id=served["context_receipt_id"], consumer_refs={
+                    "selection_version": 1, "memory_ids": ids, "source_ids": sources,
+                    "plugin_id": "game_test",
+                }), **plugin)
+        first, second = core.consumer_refs.refs("test", plugin_id="game_test")
+        self.assertEqual(first["memory_ids"], [])
+        self.assertEqual(first["source_ids"], [])
+        self.assertEqual(first["phase"], "reserved")
+        self.assertEqual(second["memory_ids"], [fact_id])
+        self.assertEqual(second["source_ids"], facts[0]["source_event_keys"])
+        self.ok("/v1/turns", self.body("ref-1", **new,
+            source_key="plugin:game_test:test:qq-friend_42:qq-friend-new:ref-1",
+            context_receipt_id=served["context_receipt_id"], memory_selection_adopted=True,
+            messages=[{"role": "user", "content": "谢谢"}], reply="不客气。"), **plugin)
+        adopted = core.consumer_refs.refs("test", plugin_id="game_test")
+        self.assertEqual({row["request_id"]: row["phase"] for row in adopted},
+                         {"ref-0": "reserved", "ref-1": "adopted"})
+        selector_scope = {**new, "client_id": "plugin"}
+        self.assertEqual(self.api.protocol.recent_for_selection(selector_scope),
+                         [{"user": "谢谢", "assistant": "不客气。"}])
+        self.assertFalse(self.api.protocol.recent_for_selection({**selector_scope, "session_id": "missing"}))
         # Deletion uses the friend's subject; the friend keeps a zero-tool session.
         asyncio.run(core.deletion_service.forget(DeletionRequest(
             scope=Scope("test", "qq-friend:42"), targets=(DeletionTarget("fact", fact_id),),
@@ -177,11 +401,16 @@ class ServiceCloseoutTests(unittest.TestCase):
         self.close()
         self.start()
         self.service.settings.clients["plugin"]["subjects"].append("qq-friend:42")
-        after = self.ok("/v1/context", dict(new, text="红茶"), **plugin)
+        after = self.ok("/v1/context", dict(new, text="红茶", segment_history=history), **plugin)
         self.assertNotIn(fact_id, after["context"].get("memory_ids") or [])
         code, error = self.request("/v1/turns", body, **plugin)
         self.assertEqual(code, 410)
         self.assertEqual(error["code"], "deleted")
+        asyncio.run(self.service.core.deletion_service.forget(DeletionRequest(
+            scope=Scope("test", "qq-friend:42"), source_keys=(body["source_key"],), reason="user_request",
+        )))
+        after_source_delete = self.ok("/v1/context", dict(new, text="红茶", segment_history=history), **plugin)
+        self.assertFalse(after_source_delete["context"].get("segment_sources"))
 
     def test_tunnel_origin_can_delete_a_fact(self):
         self.service.core.facts.save("test", [{

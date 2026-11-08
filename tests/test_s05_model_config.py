@@ -316,6 +316,7 @@ class ConsoleConfigTests(unittest.TestCase):
         self.assertIs(
             self.app.core.extraction._model, self.app.chat._service.model,
         )
+        self.assertIs(self.app.core.recall._model, self.app.chat._service.model)
 
     def test_config_file_is_not_part_of_the_export(self):
         self.call("POST", "/api/model/config", {

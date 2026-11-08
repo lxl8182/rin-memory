@@ -108,6 +108,7 @@ class TurnRequest:
     occurred_at: str = ""
     client_id: str = ""
     context_receipt_id: str = ""
+    reply_transport: str = ""
 
     def fingerprint(self) -> str:
         return turn_fingerprint(
@@ -320,7 +321,11 @@ class TurnCommitService:
         is complete by definition).
         """
         messages = [dict(item) for item in request.messages]
-        if reply and str(reply).strip() and not any(
+        if request.reply_transport:
+            messages = [message for message in messages if message.get("type") != "ai"]
+            if reply:
+                messages.append({"type": "ai", "data": {"content": "", "metadata": {"reply_transport": request.reply_transport}}})
+        elif reply and str(reply).strip() and not any(
             str(item.get("type") or "").lower() in ("ai", "assistant")
             for item in messages
         ):

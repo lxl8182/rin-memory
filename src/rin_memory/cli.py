@@ -874,7 +874,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="maintenance loop interval in seconds (default 60)",
     )
     serve_parser.add_argument(
-        "--context-budget-ms", type=int, default=1000,
+        "--context-budget-ms", type=int, default=9000,
         help="context building budget in milliseconds (default 1000)",
     )
     serve_parser.add_argument(

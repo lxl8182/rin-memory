@@ -359,6 +359,32 @@ class WorkingSummaryService:
             episode=(dict(episodes[0]) if episodes else None),
         )
 
+    def growth_candidates(self, character, subject, scene):
+        return [dict(row, _tier="growth", text=str(row.get("claim") or row.get("text") or ""))
+                for row in self._growth_rows(character, subject, scene)]
+
+    def selected(self, character, subject, scene, language, items, *, episode=None):
+        """Project the turn selection; the administrative build stays complete."""
+        labels = _labels(language)
+        versions = self._source_versions(character, subject)
+        sections = {}
+        for name, kind in (("important_facts", "fact"), ("open_threads", "thread"),
+                           ("growth", "growth"), ("episode", "experience")):
+            rows = [dict(item) for item in items if item["kind"] == kind]
+            for row in rows:
+                if kind == "thread":
+                    row["thread_id"] = row["id"]
+            lines = [f"- {row['text']}" for row in rows]
+            block = "\n".join([labels[name], *lines]) if lines else ""
+            refs = tuple(dict.fromkeys(ref for row in rows for ref in row["source_keys"]))
+            sections[name] = WorkingSummarySection(name, block, tuple(rows), refs)
+        return WorkingSummary(
+            character=character, subject=subject, sections=sections,
+            scene=normalize_scene(scene) if isinstance(scene, Mapping) else {},
+            rebuild_key=self._rebuild_key(versions), source_versions=versions, built_at=self._now_iso(),
+            episode=episode,
+        )
+
     def resolve_followup(
         self,
         character: Any,
@@ -379,7 +405,7 @@ class WorkingSummaryService:
         summary = self.build(
             character, subject=subject, scene=scene, language=language,
         )
-        threads = [dict(item) for item in summary.section("open_threads").items]
+        threads = [dict(item) for item in summary.section("open_threads").items if not item.get("mention_restricted")]
         text = str(query or "")
         terms = _terms(text)
         scored: list[tuple[float, dict[str, Any]]] = []

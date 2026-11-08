@@ -6,6 +6,8 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
+from test_b04_extraction import extraction_reply
+
 from rin_memory.adapters.composition import build_memory_core
 from rin_memory.contracts import CorrectionRequest, DeletionRequest, DeletionTarget, Scope
 from rin_memory.domain.extraction import ExtractionSettings
@@ -34,6 +36,8 @@ class Model:
         if self.during_call:
             callback, self.during_call = self.during_call, None
             await callback()
+        if kwargs["purpose"] == "memory_fact_extraction":
+            return extraction_reply(self.reply, messages[0]["content"])
         return json.dumps(self.reply, ensure_ascii=False)
 
 
@@ -79,21 +83,16 @@ class ExperienceTests(unittest.IsolatedAsyncioTestCase):
                      "sources": [1], "message_refs": [key + ":m0"]},
                     {"text": "我想了解主人散步看见的花。", "entity": "neko", "source": "ai_disclosure",
                      "evidence_kind": "observed_action", "sources": [1], "message_refs": [key + ":m1"]},
-                    {"text": "我们约好散步时留意路边的花。", "entity": "relationship", "source": "shared_experience",
-                     "sources": [1], "message_refs": [key + ":m0", key + ":m1"]},
+                    {"text": "我们散步后分享了路边的花。", "entity": "relationship", "source": "shared_experience",
+                     "sources": [1], "message_refs": [key + ":m0"]},
                 ]
-                await core.extraction.ingest_turn("demo", [message("human", "今天散步见到花了。"),
+                await core.extraction.ingest_turn("demo", [message("human", "今天散步见到花了。刚才和你分享了好多花。"),
                                                            message("ai", "我想听听那些花，下次我们也一起留意吧。")],
                                                   source_key=key, occurred_at=self.clock.now())
                 if batch:
                     await core.extraction.process_outbox("demo")
                 rows = core.facts.load("demo")
-                self.assertEqual({row["entity"] for row in rows}, {"master", "neko", "relationship"})
-                own = next(row for row in rows if row["entity"] == "neko")
-                self.assertEqual(own["evidence_kind"], "agent_expression")
-                self.assertEqual(support_basis_from_facts([own]), [])
-                self.assertEqual(own["source_bindings"][0]["role"], "assistant")
-                self.assertEqual(own["message_refs"], [key + ":m1"])
+                self.assertEqual({row["entity"] for row in rows}, {"master", "relationship"})
                 selected = next(row for row in rows if row["entity"] == "relationship")
                 # A single substantive experience can produce pending understanding.
                 model.reply = {"operation": "add", "reflection": "分享散步中的小发现让我觉得亲近。",

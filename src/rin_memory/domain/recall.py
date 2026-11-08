@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import math
 import re
 import time
@@ -37,7 +38,9 @@ from typing import Any, Mapping, Sequence
 
 from ..contracts import MemoryBlock
 from ..invalidation import filter_valid_entries, is_friend_subject, normalize_text, subject_key
-from ..ports import Clock, EmbeddingProvider, TokenCounter
+from ..ports import Clock, EmbeddingProvider, ModelInvoker, TokenCounter
+from .barrier import message_metadata, message_source_keys, message_text
+from .experience import confirmation_time
 
 # -- settings ---------------------------------------------------------------
 
@@ -93,10 +96,10 @@ class RecallSettings:
     episode_entry_max_chars: int = 600
 
     # Budget (turn_context_settings.py / memory/turn_context.py).
-    budget_seconds: float = 1.0
-    budget_ms: int = 1000
+    budget_seconds: float = 9.0
+    budget_ms: int = 9000
     min_budget_ms: int = 50
-    max_budget_ms: int = 5000
+    max_budget_ms: int = 9500
     min_remaining_seconds: float = 0.3
     http_slack_seconds: float = 0.25
     render_reserve_seconds: float = 0.1
@@ -108,6 +111,9 @@ class RecallSettings:
     suppress_mention_limit: int = 2
     suppress_window_hours: int = 5
     suppress_cooldown_hours: int = 5
+    enabled: bool = True
+    fast_chat: bool = False
+    selection_timeout_s: float = 8.5
 
     def __post_init__(self) -> None:
         for name in (
@@ -743,7 +749,6 @@ _DURABLE_SOURCES = frozenset({
     "character_card", "settings", "identity", "manual", "reflection",
     "user_correction",
 })
-_SHARED_SOURCES = frozenset({"shared_experience"})
 _OBSERVATION_SOURCES = frozenset({"user_observation", "ai_disclosure"})
 _GROWTH_KINDS = frozenset({"habit", "interest", "experience", "relationship"})
 _GROWTH_STABLE_STATUSES = frozenset({"confirmed", "promoted"})
@@ -775,13 +780,13 @@ def retention_class(entry: Any) -> str:
     """Host retention class inference (read-only; no extra activity score)."""
     if not isinstance(entry, Mapping):
         return DEFAULT_RETENTION_CLASS
+    if entry.get("protected") is True:
+        return RETENTION_DURABLE
     explicit = entry.get("retention_class") or entry.get("fading_class")
     if isinstance(explicit, str):
         normalized = explicit.strip().lower()
         if normalized in RETENTION_CLASSES:
             return normalized
-    if entry.get("protected") is True:
-        return RETENTION_DURABLE
     target = str(entry.get("target_type") or entry.get("_tier") or "").strip().lower()
     if target == "persona":
         return RETENTION_DURABLE
@@ -800,14 +805,10 @@ def retention_class(entry: Any) -> str:
         return RETENTION_TRANSIENT
     if any(entry.get(flag) is True for flag in _ENDED_FLAGS):
         return RETENTION_TRANSIENT
-    if source in _SHARED_SOURCES:
-        return RETENTION_SHARED_IMPORTANT
     temporal = str(entry.get("temporal_scope") or "").strip().lower()
     if temporal == "state":
         return RETENTION_TRANSIENT
     if temporal in ("episode", "past"):
-        return RETENTION_DAILY
-    if target == "fact_archive":
         return RETENTION_DAILY
     importance = _coerce_importance(entry.get("importance"))
     if importance is not None:
@@ -820,6 +821,16 @@ def retention_class(entry: Any) -> str:
 
 def _entry_anchor(entry: Any, last_mentioned_at: Any) -> datetime | None:
     mapping = entry if isinstance(entry, Mapping) else {}
+    if (mapping.get("_tier") in ("fact", "fact_archive") or str(mapping.get("id", "")).startswith("fact_")
+            or mapping.get("source") in _OBSERVATION_SOURCES | {"shared_experience", "user_correction"}):
+        fields = ("created_at", "added_at", "timestamp")
+        event_fields = ("event_end_at", "event_start_at")
+        fields = (*event_fields, *fields) if mapping.get("source") == "shared_experience" else (*fields, *event_fields)
+        original = next((stamp for key in fields if (stamp := _coerce_datetime(mapping.get(key))) is not None), None)
+        confirmed = _coerce_datetime(confirmation_time(mapping))
+        return max((stamp for stamp in (original, confirmed) if stamp is not None), default=None)
+    if mapping.get("_tier") == "thread":
+        return _coerce_datetime(mapping.get("event_at") or mapping.get("created_at") or mapping.get("updated_at"))
     candidates: list[datetime] = []
     mentioned = _coerce_datetime(last_mentioned_at)
     if mentioned is not None:
@@ -1578,6 +1589,130 @@ class _FallbackClock:
         return time.monotonic()
 
 
+_SELECTION_CANDIDATES = 12
+_SELECTION_ITEMS = 3
+_SELECTION_TOKENS = 600
+_ATTACHMENT_MARKER = re.compile(r"\[图片\d+[^\]]*\]")
+_SELECTION_DATE = re.compile(r"(?<!\d)\d{4}(?:(?:-\d{1,2}){1,2}|年(?:\d{1,2}月(?:\d{1,2}日)?)?)(?!\d)")
+_HISTORY_QUERY = re.compile(r"还记得|回忆|以前|曾经|当初|那次|上次|remember|back then|last time", re.I)
+_DETAIL_QUERY = re.compile(r"细节|原话|具体|怎么说|说了什么|details?|exactly|what .* say", re.I)
+_ORIGINAL_REQUEST = re.compile(r"原话|怎么说的|说过什么|说了什么|聊过什么|聊了什么|exact words|what did .* say", re.I)
+_RECALL_QUESTION = re.compile(r"[?？]|什么|哪|多久|多少|记得|回忆|查一下|\b(?:what|when|which|remember)\b", re.I)
+_DATED_RECALL = re.compile(r"发生了|记得|回忆|(?:我|你).{0,12}(?:聊|说|做了|干了|去了|见了)|what (?:happened|did (?:we|i|you))", re.I)
+_BARE_FOLLOWUP = re.compile(r"(?:上次(?:说的)?|那个|那件事|后来|怎么样了|结果(?:如何|呢)|后续|呢|[？?。！!\s])+")
+_HISTORY_FILLER = re.compile(r"说过什么|聊过什么|聊了什么|发生了什么|那天|当时|什么|哪些|我们|what happened", re.I)
+_SEMANTIC_TOPICS = (
+    (re.compile(r"忌口|饮食限制|饮食禁忌|过敏|dietary restrict|allerg", re.I),
+     re.compile(r"过敏|忌口|不能吃|不能喝|不吃|不喝|allerg|intoleran|cannot eat|avoid eating", re.I)),
+    (re.compile(r"生日|出生日期|birthday|date of birth", re.I),
+     re.compile(r"生日|出生|诞辰|birthday|born", re.I)),
+    (re.compile(r"怎么称呼我|叫我什么|我的称呼|how.*address me|what.*call me", re.I),
+     re.compile(r"名字|叫做|叫我|称呼|昵称|name|nickname", re.I)),
+)
+_RELATIVE_HISTORY = re.compile(r"昨天|前天|上周|上个月|上月|去年|yesterday|last (?:week|month|year)", re.I)
+_SEGMENT_GREETING = re.compile(r"(?:你好|您好|嗨|哈喽|早安|晚安|早上好|晚上好|早|在吗|在不在|hi|hello|hey)[呀啊哦嘛呢~～\s!！?？。]*", re.I)
+_SELECTION_PROMPT = """我为当前这一轮选有直接用途的记忆。输入 JSON 是待判断的数据。
+先只看 current 和 recent，判断本轮要回答什么。候选只有提供了原话之外的必要信息，才入选。
+例如“你想参加聚会吗？”回答意愿不需要主人的饮食偏好；“帮我选聚会菜单”才需要相关饮食限制。
+只问意愿、能力或可行性时，未来执行的限制没有本轮用途。通用方法也不需要重复用户已选对象的偏好。
+偏好和限制可以帮助个性化建议，近期对话可帮助解释指代。回答当前偏好只取最新有效陈述；明确回顾时可取相关历史。
+同话题的旧问句、已知信息、未确认建议和无关事项都不入选。related_to 标出背景，只在能补足所问细节时选入。
+只返回 JSON，最多三条互补材料，use 写一个短语说明它怎样改变当前回答。没有材料时返回 {"selected":[]}。
+{"selected":[{"key":"候选原 key","use":"当前用途"}]}
+"""
+_SEGMENT_SELECTION_PROMPT = """
+previous 是上一段的原始对话摘录。仅在 current 明确承接其中的话题或追问其中的细节时，
+另外返回 "continuation": ["previous 的 key", ...]，列出确实承接的对话。问候、新话题和
+无法确定指代的输入返回 "continuation": []。不要把 previous 的 key 放到 selected 里。
+"""
+
+
+def selection_recent(turns, current_input):
+    """At most two turns of reference material, excluding the current input."""
+    if not isinstance(turns, (list, tuple)):
+        return []
+    result = []
+    for item in turns[-4:]:
+        if isinstance(item, Mapping) and isinstance(item.get("user"), str) and isinstance(item.get("assistant"), str):
+            result.extend(({"role": "user", "text": item["user"]}, {"role": "assistant", "text": item["assistant"]}))
+        elif isinstance(item, Mapping) and item.get("role") in ("user", "assistant", "human", "ai"):
+            text = item.get("text", item.get("content"))
+            if isinstance(text, str):
+                role = "user" if item["role"] in ("user", "human") else "assistant"
+                result.append({"role": role, "text": text})
+        elif isinstance(item, str):
+            result.append({"role": "user", "text": item})
+    current = normalize_text(current_input)
+    complete = []
+    for item in result:
+        if item["role"] == "user":
+            complete.append([item])
+        elif complete and len(complete[-1]) == 1:
+            complete[-1].append(item)
+    return [dict(item, text=item["text"].strip()[:400])
+            for turn in [turn for turn in complete
+                         if normalize_text(turn[0]["text"]) != current][-2:] for item in turn]
+
+
+def _selection_window(text, now):
+    date_match = _SELECTION_DATE.search(text)
+    if date_match:
+        return parse_time_range(date_match.group().replace("年", "-").replace("月", "-").rstrip("-日"))
+    relative = _RELATIVE_HISTORY.search(text)
+    if not relative:
+        return None
+    term = relative.group().casefold()
+    today = _coerce_datetime(now).replace(hour=0, minute=0, second=0, microsecond=0)
+    if term in ("昨天", "前天", "yesterday"):
+        start = today - timedelta(days=2 if term == "前天" else 1)
+        return start, start + timedelta(days=1)
+    if term in ("上周", "last week"):
+        end = today - timedelta(days=today.weekday())
+        return end - timedelta(days=7), end
+    if term in ("上个月", "上月", "last month"):
+        end = today.replace(day=1)
+        return (end - timedelta(days=1)).replace(day=1), end
+    return today.replace(year=today.year - 1, month=1, day=1), today.replace(month=1, day=1)
+
+
+def _selection_key(row):
+    tier = row["_tier"]
+    if tier in ("fact", "fact_archive"):
+        tier = "fact"
+    elif tier == "growth":
+        tier = "reflection"
+    return f"{tier}:{row['id']}"
+
+
+def _parse_selection(raw, candidates, *, previous=()):
+    text = str(raw or "").strip()
+    if text.startswith(chr(96) * 3) and text.endswith(chr(96) * 3):
+        text = text.split("\n", 1)[-1][:-3].strip()
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    selected = data.get("selected") if isinstance(data, dict) else None
+    if not isinstance(selected, list) or len(selected) > _SELECTION_ITEMS:
+        return None
+    used, rows = set(), []
+    for item in selected:
+        key = item.get("key") if isinstance(item, dict) else None
+        if not isinstance(key, str) or key not in candidates or key in used:
+            return None
+        use = item.get("use")
+        if not isinstance(use, str) or not use.strip():
+            return None
+        used.add(key)
+        rows.append(dict(candidates[key], use=use[:160]))
+    continuation = data.get("continuation", []) if previous else []
+    allowed = {row["key"] for row in previous}
+    if (not isinstance(continuation, list) or len(continuation) > len(allowed)
+            or any(not isinstance(key, str) or key not in allowed for key in continuation)):
+        continuation = []
+    return rows, continuation
+
+
 class RecallService:
     """Read-only recall over the B05 stores plus optional vectors/tokens.
 
@@ -1606,12 +1741,14 @@ class RecallService:
         barrier: Any = None,
         token_counter: TokenCounter | None = None,
         embedding: EmbeddingProvider | None = None,
+        model: ModelInvoker | None = None,
         settings: RecallSettings | None = None,
         stop_names: Sequence[str] = (),
         roots: Any = None,
         state: Any = None,
         working_summary: Any = None,
         interests: Any = None,
+        timeindex_factory: Any = None,
     ) -> None:
         self._clock: Clock = clock if clock is not None else _FallbackClock()
         self._facts = facts
@@ -1621,6 +1758,7 @@ class RecallService:
         self._barrier = barrier
         self._tokens = _Tokens(token_counter)
         self._embedding = embedding
+        self._model = model
         self._settings = settings or RecallSettings()
         self._stop_names = tuple(
             str(name).strip() for name in stop_names or () if str(name or "").strip()
@@ -1632,6 +1770,7 @@ class RecallService:
         self._state = state
         self._working_summary = working_summary
         self._interests = interests
+        self._timeindex_factory = timeindex_factory
 
     @property
     def settings(self) -> RecallSettings:
@@ -1687,6 +1826,8 @@ class RecallService:
     ) -> dict[str, Any]:
         """Explicit recall (host recall_memory tool / /query_memory)."""
         start = self._clock.monotonic()
+        if not self._settings.enabled:
+            return self._result("miss", start, reason="memory_paused")
         try:
             character, query, subject, scene, purpose, budget_ms, max_items = (
                 self._coerce_recall_args(
@@ -1731,6 +1872,7 @@ class RecallService:
                 )
             deadline = self._deadline(start, budget_ms)
             subjects = _normalize_subjects(subject)
+            snapshot = self._barrier_snapshot(name)
             pool, scene_filtered = self._collect_pool(
                 name, subjects=subjects, scene=scene,
                 stop_names=tuple(stop_names) or self._stop_names,
@@ -1742,10 +1884,6 @@ class RecallService:
                     ]
             bm25_pool = self._candidate_rows(pool)
             embedding_pool = self._embedding_rows(pool)
-            if not bm25_pool:
-                return self._result(
-                    "miss", start, query_meta={}, scene_filtered=scene_filtered,
-                )
             tokens = _Tokens(self._token_counter)
             names = tuple(stop_names) or self._stop_names
             bm25_scored = bm25_scores(
@@ -1754,9 +1892,7 @@ class RecallService:
             ) if query_text else []
             cosine_scored: list[tuple[dict[str, Any], float]] = []
             mode = "bm25"
-            query_vector = await self._query_vector(
-                query_text, deadline, tokens,
-            )
+            query_vector = await self._query_vector(query_text, deadline, tokens) if embedding_pool else None
             if query_vector is not None and embedding_pool:
                 cosine_scored = _cosine_rank(query_vector, embedding_pool)
                 if cosine_scored:
@@ -1779,6 +1915,12 @@ class RecallService:
                 else max(0, int(max_items))
             )
             items = self._items_from_rows(fused[:limit], mode)
+            if not items and limit:
+                items = self._items_from_rows(self._original_rows(
+                    name, subjects, scene, query_text, window, limit=limit,
+                ), "original")
+                if items:
+                    mode = "original"
             if token_budget is not None and token_budget > 0:
                 kept: list[dict[str, Any]] = []
                 used = 0
@@ -1791,6 +1933,8 @@ class RecallService:
                 items = kept
             corrections_block = self._corrections_block(name, subject, scene, language)
             growth_block = self._growth_block(name, scene, language, subject)
+            if self._is_stale(name, snapshot):
+                return self._result("superseded", start)
             return self._result(
                 "matched" if items else "miss",
                 start,
@@ -1822,6 +1966,8 @@ class RecallService:
     ) -> dict[str, Any]:
         """Rows closest to a time window (host recall_by_time)."""
         start = self._clock.monotonic()
+        if not self._settings.enabled:
+            return self._result("miss", start, reason="memory_paused")
         try:
             name = self._character(character)
             if self._facts is None or self._reflections is None:
@@ -1832,8 +1978,10 @@ class RecallService:
                     "miss", start, error_code="invalid_time_range",
                 )
             subjects_value = subjects if subjects is not None else subject
+            snapshot = self._barrier_snapshot(name)
+            subject_keys = _normalize_subjects(subjects_value)
             pool, scene_filtered = self._collect_pool(
-                name, subjects=_normalize_subjects(subjects_value), scene=scene,
+                name, subjects=subject_keys, scene=scene,
                 stop_names=tuple(stop_names) or self._stop_names,
             )
             candidates = [
@@ -1860,6 +2008,10 @@ class RecallService:
             scored.sort(key=lambda item: (item[0], item[1], win_start - item[2]))
             cap = self._settings.time_budget if limit is None else max(0, int(limit))
             picked = [row for _flag, _dist, _start, row in scored[:cap]]
+            if len(picked) < cap:
+                picked.extend(self._original_rows(name, subject_keys, scene, "", window, limit=cap - len(picked)))
+            if self._is_stale(name, snapshot):
+                return self._result("superseded", start)
             items = self._items_from_rows(picked, "time")
             for item in items:
                 item["score"] = None
@@ -1890,87 +2042,424 @@ class RecallService:
         request_id: str | None = None,
         stop_names: Sequence[str] = (),
         subject: Any = None,
+        segment_history: Sequence[Mapping] = (),
     ) -> dict[str, Any]:
-        """Passive turn context (host-shaped response subset), plus M5 layers.
-
-        M5 makes two additative changes without touching the existing keys:
-
-        * 'companion_state' is now a real StateService snapshot instead of the
-          empty placeholder. It is read **once** and both rendered as a block
-          and returned verbatim, so the version the model saw and the version
-          the caller can audit are the same read -- a commit landing between
-          the two would otherwise make the payload lie;
-        * 'working_summary' and 'episode_summary' carry the rebuildable
-          projections (growth / important facts / open threads / one episode).
-
-        The open threads a continuation question resolves against are derived
-        from that same state snapshot when the caller does not supply them:
-        before M5 the parameter existed but nobody passed it, so "那个后来怎么
-        样" had no thread to continue.
-        """
+        """Select the only optional memory units this turn can deliver."""
         start = self._clock.monotonic()
-        # RO03: the turn's own words must reach the summary projector, or
-        # `important_facts` can only ever be "the most important rows" and a
-        # plain picture turn inherits facts that have nothing to do with it.
-        # One build per call is the snapshot: this read is never cached across
-        # turns, so the next turn sees the next version.
-        extras = self._turn_extras(
-            character, subject=subject, scene=scene, language=language,
-            current_input=str(current_input or ""),
+        if not self._settings.enabled:
+            return dict(self._turn_result("miss", start), reason="memory_paused",
+                        selection={"version": 1, "status": "disabled", "items": []})
+        if self._facts is None or self._reflections is None:
+            return dict(self._turn_result("unavailable", start),
+                        selection={"version": 1, "status": "unavailable", "items": []})
+        name = self._character(character)
+        subject = subject_key(subject) or "private"
+        snapshot = self._barrier_snapshot(name)
+        versions = self._barrier_versions(name)
+        deadline = self._deadline(start, budget_ms)
+        recent = selection_recent(recent_turns, current_input)
+        current = _ATTACHMENT_MARKER.sub("", str(current_input or "")).strip()[:1200]
+        previous = self._segment_reference(current, segment_history)
+        state, threads = self._selection_state(name, subject, scene, language)
+        corrections = self._corrections_block(name, subject, scene, language)
+        query, query_meta = build_recall_query(
+            current, recent_turns=recent, open_threads=open_threads,
+            max_chars=self._settings.query_max_chars, stop_names=stop_names or self._stop_names,
         )
-        threads = open_threads if open_threads is not None else extras["threads"]
-        followup = self._resolve_followup(
-            character, current_input, subject=subject, scene=scene,
-            language=language,
+        mode = "bm25"
+        status, selected, continued = "empty", [], []
+        fallback_reason = ""
+        followup = None
+        anchor = {}
+        if (self._working_summary is not None and threads and not recent and not previous
+                and continuation_markers(current) and _BARE_FOLLOWUP.fullmatch(current)):
+            followup = self._working_summary.resolve_followup(name, current, subject=subject, scene=scene, language=language)
+            if followup["status"] == "resolved":
+                anchor = followup["thread"]
+        context_limit = self._context_limit(max_context_tokens)
+        token_budget = min(_SELECTION_TOKENS, context_limit) if context_limit is not None else _SELECTION_TOKENS
+        if query and token_budget:
+            window = _selection_window(current, self._clock.now())
+            asks_original = bool(_ORIGINAL_REQUEST.search(current))
+            historical = asks_original or bool(
+                (_HISTORY_QUERY.search(current) or (window and _DATED_RECALL.search(current)))
+                and _RECALL_QUESTION.search(current)
+            )
+            candidates, mode = await self._selection_candidates(
+                name, current, query, recent, threads, scene=scene, subject=subject,
+                purpose=purpose, stop_names=stop_names or self._stop_names,
+                deadline=min(start + 1.0, deadline),
+                anchor=anchor,
+            )
+            if historical and (window or not candidates or asks_original):
+                history_query = _HISTORY_FILLER.sub("", _DETAIL_QUERY.sub("", _HISTORY_QUERY.sub(
+                    "", _RELATIVE_HISTORY.sub("", _SELECTION_DATE.sub("", current)),
+                ))).strip(" ，。？！,?!")
+                original = self._original_rows(name, (subject,), scene, history_query, window, limit=3)
+                candidates = [*original, *candidates][:_SELECTION_CANDIDATES]
+            if self._is_stale(name, snapshot):
+                status = "superseded"
+            elif candidates or previous:
+                continuation = bool(recent and len(current) <= 32 and has_anaphora(current))
+                if not anchor and (not self._settings.fast_chat or ((historical or previous or continuation)
+                                                    and self._remaining(deadline) >= 2.0)):
+                    status, selected, continued = await self._select_memory(
+                        current, recent, candidates, token_budget, deadline, previous=previous,
+                    )
+                else:
+                    selected = self._fast_selection(current, candidates, token_budget, historical=historical,
+                                                    recent=recent, anchor=anchor)
+                    status = "selected" if selected else "empty"
+                    continued = self._explicit_segment_matches(current, previous)
+                if status in ("timed_out", "unavailable", "invalid_output"):
+                    continued = self._explicit_segment_matches(current, previous)
+                    if self._settings.fast_chat or (recent and has_anaphora(current)):
+                        selected = self._fast_selection(current, candidates, token_budget, historical=historical,
+                                                        recent=recent, anchor=anchor)
+                        if selected:
+                            fallback_reason, status = status, "selected"
+        stale = self._is_stale(name, snapshot)
+        if stale:
+            selected, status = [], "superseded"
+            corrections = self._corrections_block(name, subject, scene, language)
+            state, _ = self._selection_state(name, subject, scene, language)
+        if not stale and any(item["kind"] == "thread" for item in selected):
+            current_state, current_threads = self._selection_state(name, subject, scene, language)
+            state = current_state
+            live = {(row["id"], self._tokens.truncate(row["text"], 300)) for row in current_threads}
+            selected = [item for item in selected if item["kind"] != "thread" or (item["id"], item["text"]) in live]
+            if not selected:
+                status = "empty"
+        context = "\n".join(item["text"] for item in selected)
+        episode_id = next((item["episode_id"] for item in selected if item["episode_id"]), "")
+        if episode_id and episode_id == anchor.get("episode_id"):
+            mode = "episode"
+        episode = {"episode_id": episode_id,
+                   "entries": [item for item in selected if item["episode_id"] == episode_id]} if episode_id else None
+        result = self._turn_result(
+            "superseded" if stale else "matched" if selected else "miss",
+            start, context=context, memory_ids=[item["id"] for item in selected],
+            source_ids=list(dict.fromkeys(key for item in selected for key in item["source_keys"])),
+            tokens=self._tokens.count(context), mode=mode, query_meta=query_meta,
+            corrections=corrections, episode=episode, request_id=request_id, versions=versions,
         )
-        result = await self._turn_context_core(
-            character,
-            current_input=current_input,
-            recent_turns=recent_turns,
-            open_threads=threads,
-            scene=scene,
-            purpose=purpose,
-            language=language,
-            budget_ms=budget_ms,
-            max_context_tokens=max_context_tokens,
-            request_id=request_id,
-            stop_names=stop_names,
-            subject=subject,
-            start=start,
-            followup_thread=(
-                str(followup["thread"].get("text") or "")
-                if followup.get("status") == "resolved" and followup.get("thread")
-                else ""
-            ),
-            # A brand new topic must never inherit the open thread's episode:
-            # the fallback only applies once the resolver decided the message
-            # *is* a continuation (design section 10.4 -- "an explicit new topic
-            # stops inheriting the old one").
-            followup_episode=(
-                str(followup["thread"].get("episode_id") or "")
-                if followup.get("status") == "resolved" and followup.get("thread")
-                else (
-                    extras["thread_episode"]
-                    if followup.get("status") != "not_continuation"
-                    else ""
+        result["episode_summary"] = episode
+        result["selection"] = {"version": 1, "status": status, "items": selected}
+        if fallback_reason and selected:
+            result["selection"]["fallback_reason"] = fallback_reason
+        if continued and not stale:
+            result["segment_sources"] = self._continued_sources(current, segment_history, previous, continued)
+            result["segment_anchors"] = [segment_history[int(key)]["source_key"] for key in dict.fromkeys(continued)]
+            result["segment_detail"] = bool(_DETAIL_QUERY.search(current) or _HISTORY_QUERY.search(current)
+                                            or _RELATIVE_HISTORY.search(current) or _SELECTION_DATE.search(current))
+        result["companion_state"] = state
+        result["companion_state_version"] = state["version"]
+        result["threads_source"] = "companion_state"
+        if self._working_summary is not None and not is_friend_subject(subject):
+            result["working_summary"] = self._working_summary.selected(
+                name, subject, scene, language, selected, episode=episode,
+            ).to_dict()
+        result["interest_signals"] = self._interest_snapshot(name, subject=subject, scene=scene)
+        thread = next((item for item in selected if item["kind"] == "thread"), None)
+        result["followup"] = (followup if not stale and (not anchor or thread) else None) or {
+            "status": "resolved" if thread and has_anaphora(current) else "not_continuation",
+            "thread": thread if thread and has_anaphora(current) else None,
+            "candidates": [], "clarify_basis": [],
+        }
+        result["elapsed_ms"] = self._elapsed(start)
+        return result
+
+    def _selection_state(self, character, subject, scene, language):
+        if self._state is None or is_friend_subject(subject):
+            return dict(_EMPTY_STATE), []
+        from ..persistence.state import document_with_subject, render_state_block
+
+        scene_fields = scene if isinstance(scene, Mapping) else getattr(scene, "__dict__", {})
+        snapshot = self._state.read(character, subject=subject, scene=scene_fields, language=language)
+        payload = self._state_payload(snapshot)
+        threads = []
+        for kind in ("progress", "concerns"):
+            for item in payload["state"].pop(kind, []):
+                text = str(item.get("text") or item.get("label") or "").strip()
+                if not text or item.get("state") in HIDDEN_STATUSES:
+                    continue
+                next_step = str(item.get("next_step") or "").strip()
+                threads.append(dict(
+                    item, text=text + (f"。下一步：{next_step}" if next_step else ""),
+                    _tier="thread", source_event_keys=item.get("source_event_ids") or [],
+                ))
+        payload["items"] = [item for item in payload["items"] if item.get("type") in ("thought", "mood")]
+        payload["block"] = render_state_block(
+            document_with_subject(subject, {"state": payload["state"]}),
+            subject=subject, scene=scene_fields, language=language, now=self._clock.now(),
+        )
+        return payload, threads
+
+    async def _selection_candidates(self, character, current, query, recent, threads, *,
+                                    scene, subject, purpose, stop_names, deadline, anchor):
+        settings = self._settings
+        subjects = _normalize_subjects(subject)
+        pool, _ = self._collect_pool(character, subjects=subjects, scene=scene, stop_names=stop_names)
+        rows = self._candidate_rows(pool)
+        rows += self._barrier_filter(character, threads, subjects)
+        if self._working_summary is not None and not is_friend_subject(subject):
+            rows += self._barrier_filter(character, self._working_summary.growth_candidates(
+                character, subject, scene,
+            ), subjects)
+        unique = {}
+        for row in rows:
+            if not row.get("id") or not row.get("text") or row.get("needs_rebuild"):
+                continue
+            status = row.get("status")
+            archived_fact = row["_tier"] == "fact_archive" and status == "archived"
+            if status in HIDDEN_STATUSES and status != "promoted" and not archived_fact:
+                continue
+            unique[_selection_key(row)] = row
+        rows = list(unique.values())
+        topics = [pattern for intent, pattern in _SEMANTIC_TOPICS if intent.search(current)]
+        scored = bm25_scores(query, rows, stop_names=stop_names, k1=settings.bm25_k1, b=settings.bm25_b)
+        query_vector = await self._query_vector(query, deadline, self._tokens)
+        cosine = _cosine_rank(query_vector, self._embedding_rows(pool)) if query_vector is not None else []
+        # The strong retrieval path is supplemented by wider lexical matches
+        # across all material types. Only the selector can promote one to prose.
+        strong, mode = self._passive_pick(query, scored, cosine, stop_names, purpose, candidate_limit=12)
+        strong_ids = {row["id"] for row in strong}
+        doc_frequency = {}
+        for _, _, shared in scored:
+            for term in shared:
+                doc_frequency[term] = doc_frequency.get(term, 0) + 1
+        lexical = {_selection_key(row): (score, set(tf) - _COMMON_TERMS) for row, score, tf in scored}
+        vector = {row["id"]: score for row, score in cosine if score >= settings.semantic_threshold}
+        now = self._clock.now()
+        window = _selection_window(current, now)
+        history = bool(window or _HISTORY_QUERY.search(current) or _normalize_purpose(purpose) in QUERY_PURPOSES)
+        recent_query = " ".join(_turn_texts(recent))
+        continuation = bool(recent_query and has_anaphora(current))
+        query_terms = content_terms(query, stop_names)
+        relevant_episodes = {}
+        ranked = []
+        for key, row in unique.items():
+            lexical_score, shared = lexical.get(key, (0.0, set()))
+            date_hit = bool(window and _overlaps_window(row, window))
+            thread_hit = row["_tier"] == "thread" and continuation and bool(
+                content_terms(row["text"], stop_names) & content_terms(recent_query, stop_names)
+            )
+            strength = (4 if date_hit else 0) + (3 if thread_hit else 0)
+            if row["id"] == anchor.get("thread_id") or (anchor.get("episode_id") and episode_id_of(row) == anchor["episode_id"]):
+                strength += 6
+            strength += int(row["id"] in strong_ids)
+            if row["_tier"] in ("fact", "fact_archive") and any(pattern.search(row["text"]) for pattern in topics):
+                strength += 2
+            # One shared n-gram can be noise, but a complete short search term
+            # or multiple overlapping n-grams can identify an actual subject.
+            match = len(shared) >= 2 or bool(shared and (
+                query_terms <= shared or any(len(term) >= 3 or doc_frequency[term] == 1 for term in shared)
+            ))
+            score = (lexical_score if match else 0.0) + vector.get(row["id"], 0.0)
+            factor = fading_factor(row, now=now)
+            if not (history or thread_hit) and factor < _surface_threshold("turn_context"):
+                continue
+            ranked.append((strength + score * (1.0 if history else factor), row, factor))
+            if (strength or score) and episode_id_of(row):
+                relevant_episodes.setdefault(episode_id_of(row), []).append(key)
+        groups = {}
+        background = set()
+        for rank, row, factor in sorted(ranked, key=lambda item: item[0], reverse=True):
+            episode = episode_id_of(row)
+            linked_to = relevant_episodes.get(episode, ())
+            if rank <= 0:
+                if not linked_to or episode in background:
+                    continue
+                background.add(episode)
+            key = _selection_key(row)
+            text = self._tokens.truncate(str(row["text"]).strip(), 300)
+            if not text:
+                continue
+            group = ("thread" if row["_tier"] == "thread" else "growth" if row["_tier"] in ("growth", "reflection", "persona")
+                     else "experience" if row.get("source") == "shared_experience" else "fact")
+            confirmed = confirmation_time(row)
+            groups.setdefault(group, []).append({
+                "key": key, "id": str(row["id"]), "kind": group, "text": text,
+                "source_keys": self._source_keys(row), "source": row.get("source"),
+                "evidence_kind": row.get("evidence_kind"), "entity": row.get("entity"),
+                "occurred_at": row.get("event_start_at") or row.get("created_at") or row.get("updated_at"),
+                "last_confirmed_at": confirmed.isoformat() if confirmed is not None else None,
+                "status": row.get("state") or row.get("status"),
+                "episode_id": episode, "retention_class": retention_class(row),
+                "fading_factor": factor, "related_to": list(linked_to)[:3] if rank <= 0 else [],
+                "event_end_at": row.get("event_end_at"),
+            })
+        candidates = []
+        for index in range(_SELECTION_CANDIDATES):
+            for group in groups.values():
+                if index < len(group):
+                    candidates.append(group[index])
+                    if len(candidates) == _SELECTION_CANDIDATES:
+                        return candidates, mode
+        return candidates, mode
+
+    def _fast_selection(self, current, candidates, token_budget, *, historical, recent=(), anchor=None):
+        terms = content_terms(current, self._stop_names)
+        reference = content_terms(" ".join(_turn_texts(recent)), self._stop_names) if has_anaphora(current) else set()
+        anchor = anchor or {}
+        topics = [pattern for intent, pattern in _SEMANTIC_TOPICS if intent.search(current)]
+        chosen = []
+        for item in candidates:
+            if item["kind"] == "original":
+                if historical:
+                    chosen.append(dict(item, use="历史原话"))
+                continue
+            if item["kind"] not in ("fact", "experience", "thread") or item.get("related_to"):
+                continue
+            item_terms = content_terms(item["text"], self._stop_names)
+            shared = terms & item_terms
+            covered = bool(shared and (shared == terms or (len(shared) >= 2 and len(shared) * 2 >= len(terms))))
+            covered |= any(len(term) >= 3 for term in shared) and len(shared) >= 4
+            covered |= len(reference & item_terms) >= 4
+            covered |= item["id"] == anchor.get("thread_id") or bool(
+                anchor.get("episode_id") and item["episode_id"] == anchor["episode_id"]
+            )
+            if covered or (item["kind"] == "fact" and any(pattern.search(item["text"]) for pattern in topics)):
+                chosen.append(dict(item, use="直接匹配当前问题"))
+        return self._fit_selection(chosen, token_budget)
+
+    def _original_rows(self, character, subjects, scene, query, window, *, limit):
+        if self._timeindex_factory is None:
+            return []
+        terms = content_terms(query, self._stop_names)
+        scope = normalize_scene(scene)
+        origin = (f"plugin:{scope['plugin_id']}" if scope.get("plugin_id") else
+                  f"game:{scope['game_id']}" if scope.get("game_id") else "")
+        rows = self._timeindex_factory(character).search_original(
+            subjects=subjects if subjects is not None else ("private",), scene=origin,
+            session_id=scope.get("session_id", ""), window=window,
+            terms=sorted(terms, key=lambda term: (-len(term), term))[:24], limit=max(40, limit * 5),
+        )
+        blocked = self._barrier.history_blocked_sources(character) if self._barrier is not None else set()
+        for row in self._facts.load(character) + self._facts.load_archive(character):
+            if row.get("invalidated_at") and _row_in_subjects(row, subjects):
+                blocked.update(self._source_keys(row))
+        matched = []
+        for row in rows:
+            message = json.loads(row["message"])
+            text, sources = message_text(message).strip(), message_source_keys(message)
+            meta = message_metadata(message)
+            if (not text or not sources or sources & blocked or not _row_in_subjects(meta, subjects)
+                    or not entry_applies_to_scene(meta, scene)
+                    or (self._barrier is not None and self._barrier.blocks_message(character, message))):
+                continue
+            overlap = terms & content_terms(text, self._stop_names)
+            if terms and not (len(overlap) >= 2 or terms <= overlap or
+                              any(self._is_rare_term(term) for term in overlap)):
+                continue
+            label = "用户原话" if message["type"] == "human" else "当时的回复"
+            item_id = f"original_{row['id']}"
+            stamp = _coerce_datetime(row["timestamp"])
+            date = f"（{stamp:%Y-%m-%d}）" if stamp is not None else ""
+            if overlap and self._tokens.count(text) > 230:
+                lowered = text.lower()
+                anchor = max(overlap, key=lambda term: (len(term), term))
+                position = lowered.find(anchor)
+                if position > 80:
+                    text = "…" + text[position - 80:]
+            matched.append((len(overlap), {
+                "key": "original:" + item_id, "id": item_id, "kind": "original", "_tier": "original",
+                "text": self._tokens.truncate(f"{label}{date}：{text}", 260),
+                "source_keys": sorted(sources), "occurred_at": row["timestamp"], "episode_id": "",
+            }))
+        matched.sort(key=lambda item: item[0], reverse=True)
+        return [item for _, item in matched[:limit]]
+
+    def _segment_reference(self, current, history):
+        if not current or not history or _SEGMENT_GREETING.fullmatch(current):
+            return []
+        terms = content_terms(current, self._stop_names)
+        ranked = sorted(range(len(history)), key=lambda i: (
+            len(terms & content_terms(history[i]["user"] + " " + history[i]["assistant"], self._stop_names)), i,
+        ), reverse=True)
+        indices = set(ranked[:4]) | set(range(max(0, len(history) - 2), len(history)))
+        references = []
+        for index in sorted(indices):
+            row = history[index]
+            references.append({"key": str(index), "user": self._tokens.truncate(row["user"], 100),
+                               "assistant": self._tokens.truncate(row["assistant"], 140)})
+        return references
+
+    def _continued_sources(self, current, history, previous, continued):
+        anchors = {int(row["key"]) for row in previous if row["key"] in continued}
+        terms = [content_terms(history[i]["user"] + " " + history[i]["assistant"], self._stop_names)
+                 for i in anchors]
+        query = content_terms(current, self._stop_names)
+        related = []
+        for index, row in enumerate(history):
+            shared = content_terms(row["user"] + " " + row["assistant"], self._stop_names)
+            if (index in anchors or any(len(shared & anchor) >= 3 or len(shared & anchor & query) >= 2
+                                        for anchor in terms)):
+                related.append(row["source_key"])
+        return related
+
+    def _explicit_segment_matches(self, current, previous):
+        if not previous or not (has_anaphora(current) or _HISTORY_QUERY.search(current)
+                                or _RELATIVE_HISTORY.search(current) or _DETAIL_QUERY.search(current)):
+            return []
+        topic = _DETAIL_QUERY.sub("", _HISTORY_QUERY.sub("", _RELATIVE_HISTORY.sub("", current)))
+        topic = re.sub(r"那个|这个|那件事|接着|继续|后来|怎么样了|了吗|呢", " ", topic)
+        query = content_terms(topic, self._stop_names)
+        if not query:
+            return []
+        overlaps = [(row["key"], query & content_terms(row["user"] + " " + row["assistant"], self._stop_names))
+                    for row in previous]
+        exact = [key for key, terms in overlaps if terms == query]
+        if len(exact) == 1 and (len(query) >= 2 or current.rstrip(" ？?!！。").endswith(("呢", "了吗"))):
+            return exact
+        minimum = max(3 if any(_is_cjk(char) for char in current) else 2, (len(query) + 2) // 3)
+        return [key for key, terms in overlaps if len(terms) >= minimum]
+
+    async def _select_memory(self, current, recent, candidates, token_budget, deadline, *, previous=()):
+        if self._model is None:
+            return "unavailable", [], []
+        remaining = min(self._settings.selection_timeout_s,
+                        self._remaining(deadline) - self._settings.render_reserve_seconds)
+        if remaining <= 0:
+            return "timed_out", [], []
+        material = {"current": current, "recent": recent, "candidates": [
+            {key: value for key, value in item.items() if key not in ("id", "source_keys")}
+            for item in candidates
+        ]}
+        if previous:
+            material["previous"] = previous
+        try:
+            async with asyncio.timeout(remaining):
+                raw = await self._model.invoke(
+                    "summary",
+                    [{"role": "system", "content": _SELECTION_PROMPT + (_SEGMENT_SELECTION_PROMPT if previous else "")},
+                     {"role": "user", "content": json.dumps(material, ensure_ascii=False)}],
+                    max_output_tokens=1200, timeout_s=remaining, purpose="memory_recall_selection",
                 )
-            ),
-        )
-        result["companion_state"] = extras["state"]
-        result["companion_state_version"] = extras["state_version"]
-        result["working_summary"] = extras["summary"]
-        result["threads_source"] = (
-            "caller" if open_threads is not None else "companion_state"
-        )
-        result["episode_summary"] = extras["episode"]
-        result["followup"] = followup
-        # RO03: interest evidence is reported, never injected as prose. The
-        # section it feeds (`about_owner`) is written by the user or by
-        # evolution; this is the material that decision is made from, so a
-        # caller can show it without the core writing the persona.
-        result["interest_signals"] = self._interest_snapshot(
-            character, subject=subject, scene=scene,
-        )
+        except TimeoutError:
+            return "timed_out", [], []
+        except Exception as exc:  # model adapters report their own transport failures
+            return ("timed_out" if getattr(exc, "kind", None) == "timeout" else "unavailable"), [], []
+        chosen = _parse_selection(raw, {item["key"]: item for item in candidates}, previous=previous)
+        if chosen is None:
+            return "invalid_output", [], []
+        chosen, continued = chosen
+        result = self._fit_selection(chosen, token_budget)
+        return ("selected" if result else "empty"), result, continued
+
+    def _fit_selection(self, chosen, token_budget):
+        result = []
+        used_text = set()
+        for item in chosen:
+            text = normalize_text(item["text"])
+            if text in used_text:
+                continue
+            if self._tokens.count("\n".join([*(row["text"] for row in result), item["text"]])) > token_budget:
+                continue
+            result.append(item)
+            used_text.add(text)
+            if len(result) == _SELECTION_ITEMS:
+                break
         return result
 
     def _interest_snapshot(
@@ -1990,114 +2479,6 @@ class RecallService:
         return dict(service.snapshot(
             name, subject=str(subject or "private"), scene=scene,
         ))
-
-    def _resolve_followup(
-        self,
-        character: Any,
-        query: Any,
-        *,
-        subject: Any,
-        scene: Any,
-        language: str,
-    ) -> dict[str, Any]:
-        """Which open thread a continuation question is about (M5 / G18).
-
-        "后来怎么样" has to continue the most recent open thread; when two items
-        are equally plausible the answer is *which ones*, so the caller can ask
-        a natural clarifying question instead of guessing (design section 10.4).
-        Only a continuation question is resolved: an ordinary new topic must not
-        be dragged back to an old item.
-        """
-        empty = {"status": "not_continuation", "thread": None,
-                 "candidates": [], "clarify_basis": []}
-        if self._working_summary is None or is_friend_subject(subject):
-            return empty
-        text = str(query or "")
-        if not text.strip():
-            return empty
-        if not (has_anaphora(text) or continuation_markers(text)):
-            return empty
-        try:
-            return self._working_summary.resolve_followup(
-                character, text, subject=subject, scene=scene, language=language,
-            )
-        except Exception:  # noqa: BLE001 - resolution is an optional layer
-            return {"status": "miss", "thread": None, "candidates": [],
-                    "clarify_basis": []}
-
-    def _turn_extras(
-        self,
-        character: Any,
-        *,
-        subject: Any,
-        scene: Any,
-        language: str,
-        current_input: str = "",
-    ) -> dict[str, Any]:
-        """Read the state snapshot and the summary projections once (never raises)."""
-        extras: dict[str, Any] = {
-            "state": dict(_EMPTY_STATE),
-            "state_version": 0,
-            "summary": None,
-            "episode": None,
-            "threads": None,
-            "thread_episode": "",
-        }
-        name = str(character or "").strip()
-        if not name or is_friend_subject(subject):
-            return extras
-        subject_key = str(subject or "private").strip() or "private"
-        snapshot = None
-        if self._state is not None:
-            try:
-                snapshot = self._state.read(name, subject=subject_key)
-            except Exception:  # noqa: BLE001 - state is an optional layer
-                snapshot = None
-        if snapshot is not None:
-            extras["state"] = self._state_payload(snapshot)
-            extras["state_version"] = int(getattr(snapshot, "version", 0) or 0)
-            extras["threads"] = _threads_from_state(getattr(snapshot, "state", None))
-        if self._working_summary is not None:
-            try:
-                summary = self._working_summary.build(
-                    name, subject=subject_key, scene=scene, language=language,
-                    query=current_input,
-                )
-            except Exception:  # noqa: BLE001 - a summary never fails a turn
-                summary = None
-            if summary is not None:
-                extras["summary"] = summary.to_dict()
-                extras["episode"] = (
-                    dict(summary.episode) if summary.episode else None
-                )
-                if extras["threads"] is None:
-                    items = summary.section("open_threads").items
-                    extras["threads"] = [
-                        {
-                            "text": str(item.get("text") or ""),
-                            "thread_id": item.get("thread_id"),
-                            "next_step": item.get("next_step"),
-                        }
-                        for item in items
-                        if str(item.get("text") or "").strip()
-                    ] or None
-                extras["thread_episode"] = self._thread_episode(
-                    summary, extras["threads"],
-                )
-        return extras
-
-    @staticmethod
-    def _thread_episode(
-        summary: Any, threads: Any,
-    ) -> str:
-        """The episode id the continuation target belongs to ("" when unknown)."""
-        if not threads:
-            return ""
-        lead = str((threads[0] or {}).get("text") or "").strip()
-        for item in summary.section("open_threads").items:
-            if str(item.get("text") or "").strip() == lead:
-                return str(item.get("episode_id") or "")
-        return ""
 
     @staticmethod
     def _state_payload(snapshot: Any) -> dict[str, Any]:
@@ -2121,212 +2502,6 @@ class RecallService:
         payload["lease"] = dict(lease) if isinstance(lease, Mapping) else None
         return payload
 
-    async def _turn_context_core(
-        self,
-        character: Any,
-        *,
-        current_input: Any = "",
-        recent_turns: Any = None,
-        open_threads: Any = None,
-        scene: Any = None,
-        purpose: str = "chat",
-        language: str = "zh",
-        budget_ms: int | None = None,
-        max_context_tokens: int | None = None,
-        request_id: str | None = None,
-        stop_names: Sequence[str] = (),
-        subject: Any = None,
-        start: float | None = None,
-        followup_thread: str = "",
-        followup_episode: str = "",
-    ) -> dict[str, Any]:
-        """The B06 passive-context body; M5 layers are attached by the caller."""
-        if start is None:
-            start = self._clock.monotonic()
-        try:
-            name = self._character(character)
-            if self._facts is None or self._reflections is None:
-                return self._turn_result(
-                    "unavailable", start, request_id=request_id,
-                    reason="recall components not wired",
-                )
-            settings = self._settings
-            tokens = _Tokens(self._token_counter)
-            names = tuple(stop_names) or self._stop_names
-            deadline = self._deadline(start, budget_ms)
-            snapshot = self._barrier_snapshot(name)
-            versions = self._barrier_versions(name)
-            # M5: when the caller passed no threads but the follow-up resolver
-            # identified the open item a continuation question is about, that
-            # item's text is what lets the query reach the right memories.
-            threads_for_query = open_threads
-            if not threads_for_query and followup_thread:
-                threads_for_query = [{"text": followup_thread}]
-            query, query_meta = build_recall_query(
-                current_input,
-                recent_turns=recent_turns,
-                open_threads=threads_for_query,
-                max_chars=settings.query_max_chars,
-                short_message_chars=settings.short_message_chars,
-                recent_turns_max=settings.recent_turns_max,
-                stop_names=names,
-            )
-            # M5: a resolved follow-up is the strongest signal there is about
-            # what "that" means. The thread's own text is appended to the query
-            # even when the word-overlap heuristic declined it, otherwise
-            # "那个后来怎么样" stays a miss and the continuation retrieves
-            # nothing -- which is exactly the pre-M5 behaviour this fixes.
-            if followup_thread and not query_meta.get("used_thread"):
-                merged = f"{query} {followup_thread}".strip()
-                query = merged[: settings.query_max_chars]
-                query_meta = dict(query_meta, used_thread=True,
-                                  thread_from_followup=True)
-            if not query:
-                return self._turn_result(
-                    "miss", start, query_meta=query_meta,
-                    request_id=request_id, versions=versions,
-                )
-            subjects = _normalize_subjects(subject)
-            pool, scene_filtered = self._collect_pool(
-                name, subjects=subjects, scene=scene, stop_names=names,
-            )
-            corrections_block = self._corrections_block(
-                name, subject, scene, language,
-            )
-            growth_block = self._growth_block(name, scene, language, subject)
-            bm25_pool = self._candidate_rows(pool)
-            embedding_pool = self._embedding_rows(pool)
-            if not bm25_pool:
-                return self._turn_result(
-                    "miss", start, query_meta=query_meta,
-                    scene_filtered=scene_filtered,
-                    corrections=corrections_block, growth=growth_block,
-                    request_id=request_id, versions=versions,
-                )
-            bm25_scored = bm25_scores(
-                query, bm25_pool, stop_names=names,
-                k1=settings.bm25_k1, b=settings.bm25_b,
-            )
-            query_vector = await self._query_vector(query, deadline, tokens)
-            cosine_scored: list[tuple[dict[str, Any], float]] = []
-            if query_vector is not None and embedding_pool:
-                cosine_scored = _cosine_rank(query_vector, embedding_pool)
-            picked, mode = self._passive_pick(
-                query, bm25_scored, cosine_scored, names, purpose,
-            )
-            if not picked and followup_episode:
-                # M5: a resolved continuation ("后来怎么样") continues the
-                # episode of the thread it resolved to. Counting words alone
-                # would miss it -- the current message is pure anaphora, so its
-                # only useful term is "面试" buried in a stop-word cloud. The
-                # episode membership *is* the anchor, and it is derived, so a
-                # deleted episode simply stops being selected.
-                picked = [
-                    row for row in bm25_pool
-                    if episode_id_of(row) == followup_episode
-                ][: settings.passive_max_items]
-                if picked:
-                    mode = "episode"
-            if not picked:
-                return self._turn_result(
-                    "miss", start, query_meta=query_meta, mode=mode,
-                    scene_filtered=scene_filtered,
-                    corrections=corrections_block, growth=growth_block,
-                    request_id=request_id, versions=versions,
-                )
-            rendered = render_recall_block(
-                [self._render_item(row) for row in picked],
-                language,
-                settings=settings,
-                token_counter=self._token_counter,
-            )
-            context = rendered.text.strip()
-            if not context:
-                return self._turn_result(
-                    "miss", start, query_meta=query_meta, mode=mode,
-                    scene_filtered=scene_filtered,
-                    corrections=corrections_block, growth=growth_block,
-                    request_id=request_id, versions=versions,
-                )
-            main_line_count = len(context.split("\n"))
-            source_rows = expand_source_background(
-                [self._render_item(row) for row in picked],
-                [self._render_item(row) for row in bm25_pool],
-                query=query,
-                stop_names=names,
-                max_items=settings.source_background_items,
-                max_tokens=settings.source_background_tokens,
-                min_tokens=settings.source_background_min_tokens,
-                token_counter=self._token_counter,
-            )
-            source_ids = [str(row.get("id") or "") for row in source_rows if row.get("id")]
-            if source_rows:
-                background_lines = _render_background_lines(
-                    source_rows, language, start_index=main_line_count,
-                    token_counter=self._token_counter,
-                )
-                if background_lines:
-                    context = context + "\n" + "\n".join(background_lines)
-            limit = self._context_limit(max_context_tokens)
-            if limit is not None and limit <= 0:
-                return self._turn_result(
-                    "miss", start, query_meta=query_meta, mode=mode,
-                    scene_filtered=scene_filtered,
-                    corrections=corrections_block, growth=growth_block,
-                    request_id=request_id, versions=versions,
-                )
-            if limit is not None:
-                lines, _dropped = _take_lines_within_budget(
-                    context.split("\n"), limit, tokens,
-                )
-                context = "\n".join(lines).strip()
-                if not context:
-                    return self._turn_result(
-                        "miss", start, query_meta=query_meta, mode=mode,
-                        scene_filtered=scene_filtered,
-                        corrections=corrections_block, growth=growth_block,
-                        request_id=request_id, versions=versions,
-                    )
-                kept_background = max(0, len(lines) - main_line_count)
-                source_ids = source_ids[:kept_background]
-            context_tokens = tokens.count(context)
-            corrections_block = self._trim_block(
-                corrections_block, context_tokens, limit, tokens,
-            )
-            growth_block = self._trim_block(
-                growth_block, context_tokens, limit, tokens,
-            )
-            episode = episode_background(
-                query,
-                picked,
-                bm25_pool,
-                max_items=settings.episode_background_items,
-                max_chars=settings.episode_entry_max_chars,
-            )
-            result = self._turn_result(
-                "matched", start,
-                context=context,
-                memory_ids=[str(row.get("id") or "") for row in picked],
-                tokens=context_tokens,
-                mode=mode,
-                query_meta=query_meta,
-                scene_filtered=scene_filtered,
-                source_ids=source_ids,
-                corrections=corrections_block,
-                growth=growth_block,
-                episode=episode,
-                request_id=request_id,
-                versions=versions,
-            )
-            if self._is_stale(name, snapshot):
-                result["result"] = "superseded"
-            return result
-        except Exception as exc:  # noqa: BLE001
-            return self._turn_result(
-                "error", start, request_id=request_id,
-                reason=type(exc).__name__,
-            )
-
     # -- internals: basic -------------------------------------------------
 
     @property
@@ -2343,7 +2518,7 @@ class RecallService:
     def _deadline(self, start: float, budget_ms: int | None) -> float:
         settings = self._settings
         raw = settings.budget_ms if budget_ms is None else int(budget_ms)
-        raw = max(settings.min_budget_ms, min(raw, settings.max_budget_ms))
+        raw = max(0, min(raw, settings.max_budget_ms))
         return start + raw / 1000.0
 
     def _remaining(self, deadline: float) -> float:
@@ -2648,8 +2823,11 @@ class RecallService:
         cosine_scored: Sequence[tuple[dict[str, Any], float]],
         stop_names: Sequence[str],
         purpose: Any,
+        *,
+        candidate_limit: int | None = None,
     ) -> tuple[list[dict[str, Any]], str]:
         settings = self._settings
+        limit = candidate_limit or settings.passive_max_items
         query_terms = set(tokenize(query, stop_names))
 
         def key(row: Mapping[str, Any]) -> str:
@@ -2703,7 +2881,7 @@ class RecallService:
                 [score for _row, score in cosine_scored],
                 threshold=settings.semantic_threshold,
                 lead=settings.lead_threshold,
-                max_take=settings.passive_max_items,
+                max_take=limit,
             )
             for row, score in cosine_scored[:take]:
                 offer(row, 1, score)
@@ -2711,7 +2889,7 @@ class RecallService:
             if len(query_terms) >= settings.fallback_min_query_terms:
                 for row, score in bm25_top[: settings.fallback_bm25_top]:
                     coverage = (
-                        len(doc_terms.get(key(row), set())) / len(query_terms)
+                        len(doc_terms.get(key(row), set()) & query_terms) / len(query_terms)
                         if query_terms else 0.0
                     )
                     if coverage >= settings.fallback_min_coverage:
@@ -2719,7 +2897,7 @@ class RecallService:
         if not chosen:
             return [], mode
         now = self._clock.now()
-        apply_fading = _normalize_purpose(purpose) not in QUERY_PURPOSES
+        apply_fading = candidate_limit is None and _normalize_purpose(purpose) not in QUERY_PURPOSES
         ranked = sorted(
             chosen.values(),
             key=lambda item: (
@@ -2731,7 +2909,7 @@ class RecallService:
                 ),
             ),
         )
-        return [row for _strength, _score, row in ranked[: settings.passive_max_items]], mode
+        return [row for _strength, _score, row in ranked[:limit]], mode
 
     def _is_rare_term(self, term: str) -> bool:
         cjk = sum(1 for char in term if _is_cjk(char))
@@ -2855,7 +3033,7 @@ class RecallService:
     @staticmethod
     def _source_keys(row: Mapping[str, Any]) -> list[str]:
         keys: list[str] = []
-        for field in ("source_event_keys", "source_keys", "source_key"):
+        for field in ("source_event_keys", "source_keys", "source_key", "support_event_keys"):
             value = row.get(field)
             if isinstance(value, str):
                 if value.strip():

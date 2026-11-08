@@ -450,9 +450,10 @@ class ManagementApi:
         scope = self._memory_scope(body, identity)
         character = self.console.character
         if path == "/v1/working-summary":
+            from .protocol import scene_object
             return self.service.core.working_summary_service.build(
                 character, subject=scope["subject"],
-                scene=scope["scene"] or None,
+                scene=asdict(scene_object(scope["scene"])) if scope["scene"] else None,
                 language=str(body.get("language") or "zh"),
             ).to_dict()
         return self.service.core.working_summary_service.resolve_followup(
@@ -923,6 +924,8 @@ class ManagementApi:
         text = payload.get("text")
         if text is not None and not isinstance(text, str):
             raise ApiError("invalid_argument", 400, "text must be a string")
+        if not self.service.settings.memory_enabled:
+            return {"subject": scope["subject"], "items": [], "reason": "memory_paused"}
         result = self.service.core.deletion_service.deletable_entries(
             self.console.character, query=(text or "").strip(),
             types=("fact", "reflection"), limit=20, subject=scope["subject"],
@@ -1117,7 +1120,30 @@ class ManagementApi:
             return self.console._deletion_receipt_view(receipt)
         return None
 
+    def qq_persona(self, payload: Mapping[str, Any] | None = None) -> dict:
+        """An independently edited public voice for QQ friend private chats."""
+        core = self.service.core
+        path = core.roots.character_file(self.console.character, "qq_public_persona.json")
+        with self.console._lock:
+            current = core.store.load(path) or {"text": "", "revision": 0}
+            if payload is None:
+                return dict(current)
+            text, revision = payload.get("text"), payload.get("base_revision")
+            if not isinstance(text, str) or len(text) > 8000 or type(revision) is not int:
+                raise ApiError("invalid_argument", 400, "text and base_revision are required")
+            if current["revision"] != revision:
+                raise ApiError("revision_conflict", 409, "the public QQ persona changed")
+            text = text.strip()
+            if text == current["text"]:
+                return dict(current)
+            updated = {"text": text, "revision": revision + 1}
+            core.permit.assert_writable("qq_public_persona", str(path))
+            core.store.save(path, updated)
+            return updated
+
     def get(self, path: str, query: Mapping[str, list[str]], *, identity: Mapping | None = None) -> Any:
+        if path == "/v1/qq/persona":
+            return self.qq_persona()
         if path == "/v1/host/persona":
             self.require_host_persona(identity or {})
             return self.host_persona()
@@ -1153,6 +1179,10 @@ class ManagementApi:
         return self.console.get("/api/" + path.removeprefix("/v1/"), query)
 
     def post(self, path: str, payload: Mapping[str, Any], *, identity: Mapping | None = None) -> dict[str, Any]:
+        if path == "/v1/qq/persona":
+            if identity is not None and not identity.get("admin"):
+                raise ApiError("forbidden", 403, "this operation requires the console identity")
+            return self.qq_persona(payload)
         if path == "/v1/outputs":
             return self.output_record(payload, identity or {})
         if path == "/v1/outputs/deliver":

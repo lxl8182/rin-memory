@@ -112,6 +112,9 @@ def reflection(reflection_id, text, source_fact_ids, *, embedding=None):
     return row
 
 
+from test_ro03_recall import SelectionModel
+
+
 class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -123,7 +126,7 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
 
     def build(self, name="memory", **kwargs):
         return build_memory_core(
-            memory_root=self.root / name, clock=self.clock, **kwargs,
+            memory_root=self.root / name, clock=self.clock, model=SelectionModel(), **kwargs,
         )
 
     def seed(self, core) -> None:
@@ -199,8 +202,9 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertIn("fact_run", receipt.invalidated_fact_ids)
         after_correction = await core.recall.recall_memory("demo", "跑步", purpose="query")
-        self.assertEqual(after_correction["status"], "miss")
-        self.assertEqual(after_correction["items"], [])
+        self.assertEqual(after_correction["status"], "matched")
+        self.assertEqual([item["id"] for item in after_correction["items"]], [receipt.replacement_fact_id])
+        self.assertEqual(after_correction["items"][0]["text"], "在河边跑步")
 
         context = await core.recall.build_turn_context("demo", current_input="跑步")
         # The explicit correction stays visible even though the old fact is gone.
@@ -294,14 +298,14 @@ class RecallFlowTests(unittest.IsolatedAsyncioTestCase):
         }])
         first = await core.recall.build_turn_context("demo", current_input="随便聊聊")
         self.assertEqual(first["growth"]["version"], 0)
-        self.assertEqual(len(first["growth"]["items"]), 1)
+        self.assertEqual(first["working_summary"]["sections"]["growth"]["items"], [])
         usage = await core.reflection_service.record_growth_usage(
             "demo", "ref_grow", "read", source_key="chat:1",
         )
         self.assertEqual(usage.version, 1)
-        second = await core.recall.build_turn_context("demo", current_input="随便聊聊")
-        self.assertEqual(second["growth"]["version"], 1)
-        self.assertEqual(len(second["growth"]["items"]), 1)
+        second = await core.recall.build_turn_context("demo", current_input="周末晨跑")
+        self.assertEqual(second["memory_ids"], ["ref_grow"])
+        self.assertEqual(len(second["working_summary"]["sections"]["growth"]["items"]), 1)
 
     async def test_time_recall_and_degraded_service(self):
         core = self.build()

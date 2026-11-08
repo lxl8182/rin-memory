@@ -4,8 +4,8 @@
 Python 导入名 `rin_memory`，CLI `rin-memory` / `rin-memory-run` / `rin-stack`；
 DSH 接入端是旁边的 `dsh-rin-memory`（npm `@local/dsh-rin-memory`）。
 
-- 最后更新：2026-11-03
-- 当前版本：`0.1.0.dev14`（`pyproject.toml`）
+- 最后更新：2026-11-07
+- 当前版本：`0.1.0.dev17`（`pyproject.toml`）
 - 进度只在本仓库 `docs/roadmap.md` 维护；本文件只写**长期有效的结构、边界和做法**。
 
 ---
@@ -15,24 +15,16 @@ DSH 接入端是旁边的 `dsh-rin-memory`（npm `@local/dsh-rin-memory`）。
 把 N.E.K.O 的通用记忆抽成独立项目，加上能修订人格卡的自演化，再无感接回宿主。
 情绪分析、Live2D、表情、口型、语音、打断、主动表现、游戏接管**继续走宿主原链路**。
 
-交付形态（2026-10-24 起）：新配置、新数据根、新启动入口；旧流程与旧基线不再作为前置，
-收尾后退役旧入口。当前按 `docs/s05-new-system-plan.md` 的 P0 / A—F 推进。
-
-已交付：独立服务 + 同源水彩管理台（48931）、真实模型对话与提炼/召回、更正/删除、
-人格卡发布与演化、消费回执、重启恢复、宿主文字端（48911）、DSH/QQ 接入。
-详见 `docs/roadmap.md` 的 S / Q / DM / QP / MC / FG 台账。
+独立服务是日常记忆与人格入口。管理台、N.E.K.O、DSH/QQ 与游戏通过同一服务访问，各自负责生成、表现或传输。运行链路、状态和兼容合同分别维护。
 
 ---
 
 ## 2. 先读什么
 
-1. 本文件。
-2. `docs/roadmap.md` —— **唯一状态入口**，别再在别处维护完成勾选表。
-3. `docs/s05-new-system-plan.md` 的当前工作包。
-4. 相关模块与其测试。
-5. 需要领域合同时查 `docs/design.md`（§17 是冻结接口清单）；管理台合同查 `docs/webui-console.md` §2.3。
-
-`docs/closeout.md` 与旧启动说明只用于查已有实现，不恢复旧 C06 的前置与验收要求。
+1. 本文件的架构边界和必须保持的行为合同。
+2. [完整记忆流程](docs/memory-flow.md) 与相关模块测试。
+3. [独立服务](docs/standalone-service.md) 和 [管理台与客户端合同](docs/webui-console.md)。需要旧宿主兼容字段时查 [冻结合同](docs/design.md) §17。
+4. [维护台账](docs/roadmap.md) 查当前状态，[历史索引](docs/history.md) 查原稿。项目状态只更新台账。
 
 ---
 
@@ -66,8 +58,8 @@ Steam 启动选项：`cmd /c "F:\game\projectNEKO\rin-memory\start-rin-stack.cmd
 
 ```powershell
 uv sync
-uv run python -m rin_memory                              # 十一段示例（临时根、替身模型、无网络）
-uv run python -m unittest discover -s tests -v           # 63 个测试文件
+uv run python -m rin_memory                              # 隔离示例
+uv run python -m unittest discover -s tests -v           # 核心全量
 uv build                                                  # 出 wheel / sdist
 ```
 
@@ -160,5 +152,5 @@ Windows 管道里需要明确 UTF-8 时用 `python -X utf8 -m rin_memory`。
   `service/listening.py`，不要自己调 `allow_reuse_address`。
 - 编码护栏在 `tests/test_s03_encoding.py`，已定位正确的存储编码不要重复复查。
 - `.cmd` 是 GBK/CP936，`.ps1` 与 `启动说明.txt` 是 UTF-8 BOM；改完保留编码。
-- 真实时钟重试与 `R04` 相关，单独处理。
+- 重试复用来源最初的业务时间。测试重放时使用固定时钟。
 - 不写死模型、不复制密钥；凭据只存本机（POSIX 0o600），不进响应 / 导出 / 日志。

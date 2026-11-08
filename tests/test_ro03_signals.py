@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from rin_memory.adapters.composition import build_memory_core
+from test_b04_extraction import extraction_reply
 from rin_memory.contracts import (
     CorrectionRequest,
     DeletionRequest,
@@ -63,6 +64,8 @@ class SignalModel:
     async def invoke(self, tier, messages, *, max_output_tokens, timeout_s, purpose):
         self.calls.append(messages[0]["content"] if messages else "")
         reply = self.replies.pop(0) if self.replies else {"facts": []}
+        if purpose == "memory_fact_extraction":
+            return extraction_reply(reply, messages[0]["content"])
         return reply if isinstance(reply, str) else json.dumps(reply, ensure_ascii=False)
 
 

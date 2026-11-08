@@ -9,9 +9,10 @@ model is running cannot be resurrected by the late result.
 """
 
 import json
+import re
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from rin_memory.adapters.composition import build_memory_core
@@ -28,6 +29,35 @@ class FixedClock:
 
     def monotonic(self) -> float:
         return 0.0
+
+
+def extraction_reply(response, prompt):
+    """Adapt readable fact fixtures to the numbered-message model contract."""
+    if isinstance(response, str):
+        try:
+            response = json.loads(response)
+        except ValueError:
+            return response
+    if isinstance(response, list):
+        facts = response
+    elif isinstance(response, dict):
+        facts = response.get("facts", [])
+    else:
+        return json.dumps(response)
+    evidence = re.findall(r"^\[(\d+)\].*?\| (user|assistant|tool) \| .*?message_ref=([^\s]+)",
+                          prompt, flags=re.MULTILINE)
+    indices = sorted({int(index) for index, _, _ in evidence})
+    for row in facts:
+        row.setdefault("operation", "add")
+        row.setdefault("retention_class", "normal")
+        row.setdefault("retention_reason", "用于后续交流")
+        if len(indices) == 1:
+            row.setdefault("sources", indices)
+        role = "assistant" if row.get("source") == "ai_disclosure" else "user"
+        if isinstance(row.get("sources"), list):
+            row.setdefault("message_refs", [ref for index, speaker, ref in evidence
+                                            if int(index) in row["sources"] and speaker == role])
+    return json.dumps(response, ensure_ascii=False)
 
 
 class FakeModel:
@@ -50,7 +80,7 @@ class FakeModel:
             item = self.responses.pop(0)
             if isinstance(item, Exception):
                 raise item
-            return item
+            return extraction_reply(item, messages[0]["content"]) if purpose == "memory_fact_extraction" else item
         return "[]"
 
 
@@ -109,8 +139,8 @@ class ExtractionFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("别的会话秘密", prompt)
         self.assertNotIn("秘密建议", prompt)
         self.assertIn("assistant | 本轮未确认的推测", prompt)
-        self.assertIn("临时操作、一次性尺寸调整", prompt)
-        self.assertIn("event_when 是可选字段", prompt)
+        self.assertIn("只针对当前回复", prompt)
+        self.assertIn("可填写 event_when", prompt)
         self.assertNotIn('"offset": -1', prompt)
         fact = core.facts.load("demo")[0]
         self.assertIsNone(fact["event_start_at"])
@@ -152,6 +182,8 @@ class ExtractionFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         shared = next(row for row in core.facts.load("demo") if row["source"] == "shared_experience")
         self.assertEqual(shared["applies_to"], {})
+        self.assertEqual(shared["retention_class"], "normal")
+        self.assertNotIn("last_confirmed_at", shared)
         self.assertEqual(shared["source_event_keys"], ["plugin:sts2_autoplay:demo:private:r1:exp1"])
         for number, applies_to in enumerate(({"game_id": "sts2"}, {"game_id": "sts2", "session_id": "r1"}), 2):
             scoped = human("主人和猫娘一起通关")
@@ -226,37 +258,71 @@ class ExtractionFlowTests(unittest.IsolatedAsyncioTestCase):
         reopened = build_memory_core(memory_root=self.root / "memory", clock=self.clock)
         self.assertEqual(len(reopened.facts.load("demo")), 2)
 
-    async def test_assistant_lines_never_become_user_facts_and_upgrade_is_monotonic(self):
-        model = FakeModel([candidates(
-            {"text": "角色喜欢雨天", "entity": "neko", "source": "ai_disclosure"},
-        )])
+    async def test_assistant_lines_do_not_become_or_refresh_user_facts(self):
+        model = FakeModel([
+            candidates({"text": "用户喜欢雨天"}),
+            candidates({"text": "用户喜欢雨天", "message_refs": ["host:demo:private:e3:m1"]}),
+            candidates({"text": "角色喜欢雨天", "entity": "neko", "source": "ai_disclosure"}),
+        ])
         core = self.build(model)
-        result = await core.extraction.ingest_turn(
-            "demo",
-            [human("今天下雨了", "host:demo:private:e2"), assistant("我其实喜欢雨天")],
-            source_key="host:demo:private:e2",
+        first = await core.extraction.ingest_turn(
+            "demo", [human("我一直喜欢雨天")], source_key="host:demo:private:e2",
         )
-        self.assertEqual(result.status, "extracted")
-        prompt = model.calls[0]["messages"][0]["content"]
-        self.assertIn("user | 今天下雨了", prompt)
-        self.assertIn("assistant | 我其实喜欢雨天", prompt)
-        rows = core.facts.load("demo")
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["source"], "ai_disclosure")
-        self.assertEqual(rows[0]["entity"], "neko")
-        self.assertTrue(rows[0]["signal_processed"])
+        self.assertEqual(first.status, "extracted")
+        [original] = core.facts.load("demo")
+        second = await core.extraction.ingest_turn(
+            "demo", [human("今天下雨了"), assistant("我记得你喜欢雨天")],
+            source_key="host:demo:private:e3", occurred_at=self.clock.now() + timedelta(days=3),
+        )
+        self.assertEqual(second.reason, "unresolved_sources")
+        third = await core.extraction.ingest_turn(
+            "demo", [human("今天下雨了"), assistant("我其实喜欢雨天")],
+            source_key="host:demo:private:e4", occurred_at=self.clock.now() + timedelta(days=4),
+        )
+        self.assertEqual(third.status, "extracted")
+        self.assertEqual(core.facts.load("demo"), [original])
 
-        second = FakeModel([candidates({"text": "角色喜欢雨天", "entity": "neko", "source": "user_observation"})])
-        core.extraction._model = second  # same data root, new model stand-in
-        upgraded = await core.extraction.ingest_turn(
-            "demo", [human("我也喜欢雨天", "host:demo:private:e3")],
-            source_key="host:demo:private:e3",
-        )
-        self.assertEqual(upgraded.status, "extracted")
-        rows = core.facts.load("demo")
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["source"], "user_observation")
-        self.assertFalse(rows[0]["signal_processed"])
+    async def test_confirm_and_correct_keep_one_fact_and_use_spoken_time(self):
+        model = FakeModel()
+        core = self.build(model)
+        now = self.clock.now()
+
+        async def extract(key, spoken, user, **answer):
+            model.responses.append(candidates(answer))
+            return await core.extraction.extract_facts(
+                "demo", [human(user)], source_keys=[f"host:demo:private:{key}"], occurred_at=spoken,
+            )
+
+        await extract("first", now, "我喜欢乌龙茶", text="我记得主人喜欢乌龙茶",
+                      retention_class="normal")
+        [row] = core.facts.load("demo")
+        target = row["id"]
+        for key, days in (("new", 3), ("new", 3), ("late", 1)):
+            outcome = await extract(key, now + timedelta(days=days), "乌龙茶是我最爱喝的",
+                                    text="对方偏爱乌龙茶", operation="confirm", target_id=target,
+                                    retention_class="durable")
+            self.assertEqual(outcome.status, "completed")
+        [confirmed] = core.facts.load("demo")
+        self.assertEqual(confirmed["text"], row["text"])
+        self.assertEqual(confirmed["retention_class"], "normal")
+        self.assertEqual(confirmed["confirm_count"], 3)
+        self.assertEqual(confirmed["last_confirmed_at"], (now + timedelta(days=3)).isoformat())
+        self.assertEqual(confirmed["confirmation_basis"], "user")
+        invalid = await extract("bad", now, "乌龙茶是我最爱喝的", text="喜欢乌龙茶",
+                                operation="confirm", target_id="not-offered")
+        self.assertEqual(invalid.reason, "invalid_fact_target")
+        result = await extract("corrected", now, "你记错了，我喜欢乌龙茶以外的白茶",
+                               text="我记得主人喜欢白茶", operation="correct", target_id=target)
+        self.assertEqual(result.status, "completed")
+        old, replacement = core.facts.load("demo")
+        self.assertTrue(old["invalidated_at"])
+        self.assertEqual(replacement["text"], "我记得主人喜欢白茶")
+        self.assertEqual(replacement["source_event_keys"], ["host:demo:private:corrected"])
+        self.assertIn("白茶", core.correction_service.block("demo").block)
+        await extract("corrected", now, "你记错了，我喜欢乌龙茶以外的白茶",
+                      text="对方偏爱白茶", operation="add")
+        self.assertEqual(len(core.facts.load("demo")), 2)
+        self.assertEqual(len(core.correction_service.active("demo")["items"]), 1)
 
     async def test_failed_extraction_keeps_raw_text_and_retries(self):
         model = FakeModel([RuntimeError("provider down"), candidates(

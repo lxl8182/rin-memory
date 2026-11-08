@@ -54,7 +54,7 @@ from typing import Any, Mapping, Sequence
 
 from ..errors import CorruptStoreError, InvalidSchemaError
 from ..ports import Clock, StorageRoots, WritePermit
-from .recent import message_source_keys
+from .recent import merge_qq_reply_parts, message_source_keys
 
 #: File name inside `<character_dir>`; the host uses this exact name.
 DB_FILENAME = "time_indexed.db"
@@ -390,6 +390,72 @@ class TimeIndexStore:
             except sqlite3.OperationalError as exc:
                 raise ValueError(f"invalid FTS5 query {query!r}: {exc}") from exc
             return [dict(row) for row in rows]
+
+    def search_original(
+        self, *, subjects: Sequence[str], scene: str | None, session_id: str,
+        terms: Sequence[str], window: tuple[datetime, datetime] | None, limit: int,
+    ) -> list[dict[str, Any]]:
+        """Search stored dialogue with scope and time applied before the limit."""
+        if not subjects or not (terms or window) or not self._resolve_path().is_file():
+            return []
+        metadata = "coalesce(json_extract(message,'$.metadata'), json_extract(message,'$.data.metadata'))"
+        body = "json_extract(message,'$.data.content')"
+        placeholders = ",".join("?" for _ in subjects)
+        conditions = [
+            f"coalesce(nullif(json_extract({metadata},'$.subject'),''),'private') IN ({placeholders})",
+            "json_extract(message,'$.type') IN ('human','ai')",
+            f"{body} IS NOT NULL",
+        ]
+        args: list[Any] = list(subjects)
+        if scene is not None:
+            conditions.append(f"coalesce(json_extract({metadata},'$.scene'),'') = ?")
+            args.append(scene)
+        if session_id:
+            conditions.append("session_id = ?")
+            args.append(session_id)
+        if window:
+            conditions.append("julianday(timestamp) >= julianday(?) AND julianday(timestamp) < julianday(?)")
+            args.extend(value.astimezone().isoformat() for value in window)
+        if terms:
+            conditions.append("(" + " OR ".join(f"instr(lower({body}), ?) > 0" for _ in terms) + ")")
+            args.extend(terms)
+        with self:
+            rows = self._require_open().execute(
+                f"SELECT id, message, timestamp FROM {ORIGINAL_TABLE} "
+                "WHERE CASE WHEN json_valid(message) THEN " + " AND ".join(conditions)
+                + " ELSE 0 END ORDER BY julianday(timestamp) DESC, id DESC LIMIT ?",
+                (*args, limit),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def add_qq_reply_parts(self, session_id: str, source_key: str, parts: Mapping[int, str]) -> None:
+        if not self._resolve_path().is_file():
+            return
+        with self:
+            connection = self._require_open()
+            rows = connection.execute(
+                f"SELECT id, message FROM {ORIGINAL_TABLE} WHERE session_id = ? "
+                "AND CASE WHEN json_valid(message) THEN json_extract(message,'$.data.metadata.source_key') = ? END",
+                (session_id, source_key),
+            ).fetchall()
+            changes = []
+            for row in rows:
+                message = json.loads(row["message"])
+                if merge_qq_reply_parts(message, source_key, parts):
+                    changes.append((json.dumps(message, ensure_ascii=False), row["id"]))
+            if not changes:
+                return
+            self._permit.assert_writable("qq_reply_parts", str(self._path))
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                for message, row_id in changes:
+                    connection.execute(f"UPDATE {ORIGINAL_TABLE} SET message = ? WHERE id = ?", (message, row_id))
+                    connection.execute(f"DELETE FROM {FACTS_FTS_TABLE} WHERE fact_id = ?", (str(row_id),))
+                    connection.execute(f"INSERT INTO {FACTS_FTS_TABLE}(fact_id, content) VALUES (?, ?)", (str(row_id), message))
+                connection.execute("COMMIT")
+            except BaseException:
+                self._rollback(connection)
+                raise
 
     def count_original(self) -> int:
         """Number of raw conversation rows."""

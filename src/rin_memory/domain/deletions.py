@@ -32,10 +32,10 @@ derived rows resolved before a failed step.
 from __future__ import annotations
 
 import asyncio
-import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 
+from .experience import confirmation_time, fact_support_groups
 from ..contracts import DeletionReceipt, DeletionRequest
 from ..errors import DeletionConflictError, DeletionNotFoundError
 from ..invalidation import normalize_text, row_matches_subject, text_hash
@@ -108,8 +108,6 @@ class DeletionService:
         self._outbox = outbox
         self._services = services or DeletionServices()
         self._cache_invalidators = tuple(cache_invalidators)
-        self._locks: dict[str, threading.RLock] = {}
-        self._locks_guard = threading.Lock()
         # A journal entry this build writes must be replayable; registering the
         # handler before the first write is the B02 recovery order.
         journal.register_handler(DELETION_EVENT_TYPE, deletions.replay_snapshot)
@@ -216,7 +214,7 @@ class DeletionService:
     def _forget_sync(self, request: DeletionRequest) -> DeletionReceipt:
         character = request.scope.character
         spec = self._spec_from_request(request)
-        with self._lock(character):
+        with self._barrier.write_lock(character):
             prepared = self._deletions.prepare_registration(character, spec)
             if prepared.conflict:
                 raise DeletionConflictError(
@@ -254,7 +252,7 @@ class DeletionService:
             return self._receipt(receipt, request_id=request.request_id)
 
     def _retry_sync(self, character: str, deletion_id: str, force: bool = False) -> DeletionReceipt:
-        with self._lock(character):
+        with self._barrier.write_lock(character):
             record = self._raw_record(character, deletion_id)
             if record is None:
                 raise DeletionNotFoundError(f"unknown deletion {deletion_id!r}")
@@ -286,7 +284,7 @@ class DeletionService:
         failed: Sequence[str] | None,
         detail: str | None,
     ) -> DeletionReceipt:
-        with self._lock(character):
+        with self._barrier.write_lock(character):
             receipt = self._deletions.record_plugin_receipt(
                 character, deletion_id, plugin_id, status,
                 cleaned=cleaned, failed=failed, detail=detail,
@@ -522,7 +520,7 @@ class DeletionService:
                     hit = True
             if not hit:
                 continue
-            if not hard and (row_keys - requested_keys):
+            if not hard and any(not requested_keys.intersection(group) for group in fact_support_groups(row)):
                 # Incidental match on a fact that still rests on another
                 # source: the row survives, so nothing about it may become a
                 # tombstone. Recording its id or text hash here would delete it
@@ -530,7 +528,10 @@ class DeletionService:
                 continue
             if isinstance(row_id, str) and row_id and row_id not in matched_ids:
                 matched_ids.append(row_id)
-            matched_episodes.update(row_episodes)
+            # A source-only deletion can invalidate a composite fact without
+            # deleting its other messages, or the episode they belong to.
+            if not hard and row_keys - requested_keys:
+                continue
             if row_hash:
                 matched_hashes.add(row_hash)
             for key in row_keys:
@@ -722,16 +723,25 @@ class DeletionService:
                 str(key) for key in row.get("source_event_keys") or ()
                 if isinstance(key, str)
             ]
-            kept = [key for key in keys if key not in source_keys]
+            groups = [group for group in fact_support_groups(row) if not source_keys.intersection(group)]
+            supported = {key for group in groups for key in group}
+            kept = [key for key in keys if key in supported]
             if kept == keys:
                 return False
             row["source_event_keys"] = kept
+            row["support_groups"] = groups
             if "source_bindings" in row:
                 row["source_bindings"] = [binding for binding in row["source_bindings"]
-                                          if binding.get("source_key") not in source_keys]
+                                           if binding.get("source_key") in supported]
                 row["message_refs"] = [binding["message_ref"] for binding in row["source_bindings"]]
+                confirmed = confirmation_time(row)
+                if confirmed is None:
+                    row.pop("last_confirmed_at", None)
+                    row.pop("confirmation_basis", None)
+                else:
+                    row["last_confirmed_at"] = confirmed.isoformat()
             if "reflection_source_keys" in row:
-                row["reflection_source_keys"] = [key for key in row["reflection_source_keys"] if key not in source_keys]
+                row["reflection_source_keys"] = [key for key in row["reflection_source_keys"] if key in supported]
             return True
 
         hard_ids = {str(value) for value in resolved.get("explicit_fact_ids") or ()}
@@ -1103,14 +1113,6 @@ class DeletionService:
             if isinstance(record, dict) and record.get("deletion_id") == deletion_id:
                 return record
         return None
-
-    def _lock(self, character: str) -> threading.RLock:
-        with self._locks_guard:
-            lock = self._locks.get(character)
-            if lock is None:
-                lock = threading.RLock()
-                self._locks[character] = lock
-            return lock
 
 
 def _unique_ids(values: Sequence[Any]) -> list[str]:

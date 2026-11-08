@@ -15,6 +15,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from test_b04_extraction import extraction_reply
+
 from rin_memory.adapters.composition import build_memory_core
 from rin_memory.cli import acquire_writer_lock, main as cli_main, release_writer_lock
 from rin_memory.contracts import DeletionRequest, Scope
@@ -48,10 +50,10 @@ class FakeModel:
     async def invoke(self, tier, messages, *, max_output_tokens, timeout_s, purpose):
         self.calls.append(purpose)
         if purpose == "memory_fact_extraction":
-            return json.dumps([{
+            return extraction_reply([{
                 "text": "用户喜欢晨跑", "importance": 7,
                 "source": "user_observation",
-            }], ensure_ascii=False)
+            }], messages[0]["content"])
         return "[]"
 
 

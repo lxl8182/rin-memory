@@ -84,6 +84,8 @@ class ServiceProtocol:
                 self._sessions.remove(key)
 
     def recent(self, scope: Mapping) -> list[dict]:
+        from ..domain.barrier import message_text
+
         rows = []
         for message in self.core.barrier.filter_messages(self.character, self.core.recent.messages(self.character)):
             data = message.get("data") or {}
@@ -94,9 +96,66 @@ class ServiceProtocol:
                 continue
             if scope["session_id"] and meta.get("session_id", "") != scope["session_id"]:
                 continue
-            if message.get("type") in ("human", "ai"):
+            if message.get("type") in ("human", "ai") and message_text(message).strip():
                 rows.append(message)
         return rows[-20:]
+
+    def recent_for_selection(self, scope: Mapping) -> list[dict]:
+        from ..domain.barrier import message_source_keys, message_text
+
+        turns = []
+        pending = None
+        for message in self.recent(scope):
+            if message["type"] == "human":
+                pending = message
+            elif pending and message_source_keys(pending) & message_source_keys(message):
+                turns.append({"user": message_text(pending), "assistant": message_text(message)})
+                pending = None
+        return turns[-2:]
+
+    def segment_history(self, scope: Mapping, history: Any) -> tuple[list[dict], bool]:
+        """Check previous QQ exchanges within the authenticated subject."""
+        if (not isinstance(history, Mapping) or not scope["session_id"]
+                or (scope["subject"] != "private" and not is_friend_subject(scope["subject"]))):
+            return [], False
+        client = self.service.settings.clients.get(scope["client_id"]) or {}
+        plugin = client.get("plugin_id")
+        scene = scene_object(scope["scene"])
+        rows = history.get("exchanges")
+        if (not plugin or scene.plugin_id != plugin or not isinstance(rows, list) or not rows
+                or history.get("mode") not in ("budget", "topic")):
+            return [], False
+        cold = history.get("mode") == "topic"
+        corrected = {
+            key for row in self.core.correction_service.active(
+                self.character, subject=scope["subject"], scene=scene,
+            )["items"]
+            for field in ("target_source_keys", "invalidated_source_keys") for key in row.get(field) or ()
+        }
+        ledger = self.core.ledger.load_view(self.character)
+        barrier = self.core.barrier
+        allowed = {}
+        for row in rows[-30:]:
+            if not isinstance(row, Mapping):
+                continue
+            key = row.get("source_key")
+            parsed = parse_source_key(key)
+            if (not parsed or parsed["kind"] != "plugin" or parsed["plugin_id"] != plugin
+                    or parsed["session_id"] == scope["session_id"] or key in corrected):
+                continue
+            entry = ledger.get(key) or {}
+            saved_scene = scene_object(entry.get("scene"))
+            if (entry.get("subject") != scope["subject"] or saved_scene.plugin_id != scene.plugin_id
+                    or saved_scene.game_id != scene.game_id or saved_scene.session_id != parsed["session_id"]
+                    or entry.get("content_class") != "chat" or barrier.blocks_source_key(self.character, key)):
+                continue
+            user, reply = row.get("user"), row.get("reply")
+            if (not isinstance(user, str) or not user.strip() or not isinstance(reply, str) or not reply.strip()
+                    or barrier.blocks_text(self.character, user) or barrier.blocks_text(self.character, reply)):
+                continue
+            allowed[key] = {"source_key": key, "user": user[:8000] if cold else "",
+                            "assistant": reply[:8000] if cold else ""}
+        return list(allowed.values()), cold
 
     @staticmethod
     def context_layers(recall: Mapping[str, Any]) -> dict:
@@ -145,9 +204,10 @@ class ServiceProtocol:
                       and scene_applies(section_scopes.get(key, {}).get("applies_to"), scene_object(scope["scene"]))}
         if friend:
             projection = {}
+        memory_enabled = self.service.settings.memory_enabled
         correction = self.core.correction_service.block(
             self.character, subject=scope["subject"], scene=scene_object(scope["scene"]),
-        )
+        ) if memory_enabled else None
         client_id = scope.get("client_id", "")
         client = self.service.settings.clients.get(client_id) or {}
         web = client_id in ("", "console")
@@ -164,9 +224,11 @@ class ServiceProtocol:
             "card_revision": 0 if friend else published.revision if published.available else card.revision,
             "projection": projection, "persona": "\n\n".join(projection.values()),
             "expression": self.expression(projection, card, published),
-            "memory_awareness": {} if friend else awareness,
-            "context": recall, "corrections": {"block": correction.block, "version": correction.version},
-            "recent_turns": self.recent(scope), "context_receipt_id": receipt_id,
+            "memory_enabled": memory_enabled,
+            "memory_awareness": {} if friend or not memory_enabled else awareness,
+            "context": recall, "corrections": {"block": correction.block, "version": correction.version}
+            if correction is not None else {"block": "", "version": 0},
+            "recent_turns": self.recent(scope) if memory_enabled else [], "context_receipt_id": receipt_id,
             "expires_in_s": 300,
             "basis": basis,
             "mention_preferences": [row["term"] for row in self.core.directives.active(self.character)]
@@ -261,7 +323,7 @@ class ServiceProtocol:
             recorded = None
             if "consumer_refs" in body:
                 recorded = self._record_consumer_ref(
-                    body, scope, context, request_id, identity=identity,
+                    body, scope, context, request_id, identity=identity, phase="reserved",
                 )
         result = {"status": "reserved", "request_id": request_id, "durable": True}
         if recorded is not None:
@@ -272,7 +334,7 @@ class ServiceProtocol:
 
     def _record_consumer_ref(
         self, body: Mapping, scope: Mapping, context: Mapping, request_id: str,
-        *, identity: Mapping | None = None,
+        *, identity: Mapping | None = None, phase: str = "adopted",
     ) -> bool:
         """Persist which memories this plugin session actually consumed (QP05).
 
@@ -298,30 +360,32 @@ class ServiceProtocol:
         if store is None or not plugin_id:
             return False
         served = context.get("context") or {}
-        served_ids = [str(item) for item in served.get("memory_ids") or () if item]
-        served_sources = [str(item) for item in served.get("source_ids") or () if item]
-        summary = context.get("working_summary") or {}
-        for section in (summary.get("sections") or {}).values():
-            served_sources.extend(str(key) for key in section.get("refs") or () if key)
-            for item in section.get("items") or ():
-                if item.get("id"):
-                    served_ids.append(str(item["id"]))
-                served_sources.extend(str(key) for key in item.get("source_keys") or () if key)
-        served_ids = list(dict.fromkeys(served_ids))
-        served_sources = list(dict.fromkeys(served_sources))
-        wanted = declared.get("memory_ids")
-        if isinstance(wanted, list) and wanted:
-            claimed_ids = {str(item) for item in wanted}
-            # The claim is a *filter*, not a source of truth: it may only narrow
-            # what this receipt really carried, and an empty intersection falls
-            # back to the served rows so a client bug cannot hide a copy from
-            # the deletion loop (over-notifying costs one extra session check,
-            # under-notifying leaves text in the chat history).
-            memory_ids = [item for item in served_ids if item in claimed_ids] or served_ids
+        selection = served.get("selection") or {}
+        declared_version = declared.get("selection_version")
+        exact = type(declared_version) is int and declared_version == selection.get("version") == 1
+        if exact:
+            if not all(isinstance(declared.get(field), list) for field in ("memory_ids", "source_ids")):
+                raise ApiError("invalid_argument", "selection v1 requires explicit memory_ids and source_ids arrays")
+            memory_ids, source_ids = self._selected_refs(context)
+            memory_ids = [item for item in memory_ids if item in declared["memory_ids"]]
+            source_ids = [item for item in source_ids if item in declared["source_ids"]]
         else:
-            memory_ids = served_ids
-        source_ids = [str(item) for item in declared.get("source_ids") or ()
-                      if item and str(item) in served_sources] or served_sources
+            served_ids = [str(item) for item in served.get("memory_ids") or () if item]
+            served_sources = [str(item) for item in served.get("source_ids") or () if item]
+            summary = context.get("working_summary") or {}
+            for section in (summary.get("sections") or {}).values():
+                served_sources.extend(str(key) for key in section.get("refs") or () if key)
+                for item in section.get("items") or ():
+                    if item.get("id"):
+                        served_ids.append(str(item["id"]))
+                    served_sources.extend(str(key) for key in item.get("source_keys") or () if key)
+            served_ids = list(dict.fromkeys(served_ids))
+            served_sources = list(dict.fromkeys(served_sources))
+            wanted = declared.get("memory_ids")
+            claimed_ids = {str(item) for item in wanted} if isinstance(wanted, list) else set()
+            memory_ids = [item for item in served_ids if item in claimed_ids] or served_ids
+            source_ids = [str(item) for item in declared.get("source_ids") or ()
+                          if item and str(item) in served_sources] or served_sources
         generation = str(declared.get("context_generation") or "")[:120]
         if not generation:
             generation = "%s:%s" % (
@@ -338,8 +402,34 @@ class ServiceProtocol:
             "persona_version": str(context.get("persona_version") or ""),
             "context_generation": generation,
             "deletion_version": int((context.get("basis") or {}).get("deletion_version") or 0),
+            "phase": phase if exact else "adopted",
         })
         return True
+
+    @staticmethod
+    def _selected_refs(context: Mapping) -> tuple[list[str], list[str]]:
+        from ..domain.barrier import message_source_keys
+
+        served = context.get("context") or {}
+        selected = served["selection"]["items"]
+        ids = [item["id"] for item in selected]
+        sources = [source for item in selected for source in item["source_keys"]]
+        for row in context.get("recent_turns") or ():
+            sources.extend(sorted(message_source_keys(row)))
+        for row in (served.get("corrections") or {}).get("items") or ():
+            if row.get("source_key"):
+                sources.append(row["source_key"])
+        for row in (context.get("state") or {}).get("items") or ():
+            sources.extend(row.get("source_event_ids") or ())
+        sources.extend(served.get("segment_sources") or ())
+        return list(dict.fromkeys(ids)), list(dict.fromkeys(sources))
+
+    def adopt_references(self, scope: Mapping, request_id: str) -> None:
+        store = self.core.consumer_refs
+        for row in store.refs(self.character):
+            if (row["phase"] == "reserved" and row["request_id"] == request_id
+                    and row["session_id"] == scope["session_id"] and row["subject"] == scope["subject"]):
+                store.record(self.character, dict(row, phase="adopted"))
 
     def consume(self, body: Mapping, *, identity: Mapping | None = None) -> dict:
         """Adopt an output generation's context without reserving a chat turn."""
@@ -512,6 +602,7 @@ class ServiceProtocol:
             if not isinstance(parts, list) or not parts:
                 raise ApiError("invalid_argument", "sent receipts need the accepted parts")
             accepted: list[dict] = []
+            confirmed_text: dict[int, str] = {}
             sent_chars = 0
             for part in parts:
                 if not isinstance(part, Mapping):
@@ -520,13 +611,33 @@ class ServiceProtocol:
                 if isinstance(count, bool) or not isinstance(count, int) or count < 0:
                     raise ApiError("invalid_argument", "a part's chars must be a non-negative integer")
                 sent_chars += count
+                index = len(accepted)
+                if "text" in part:
+                    index, text = part.get("index"), part["text"]
+                    if (transport not in ("qq_official", "qq_napcat")
+                            or type(index) is not int or not 0 <= index <= 1024 or index in confirmed_text
+                            or not isinstance(text, str) or len(text) != count or not text.strip()
+                            or text not in (record.reply or "")):
+                        raise ApiError("invalid_argument", "invalid QQ reply part")
+                    confirmed_text[index] = text
                 accepted.append({
-                    "index": len(accepted),
+                    "index": index,
                     "platform_id": str(part.get("platform_id") or "")[:200],
                     "chars": count,
                 })
             if sent_chars > len(record.reply or ""):
                 raise ApiError("invalid_argument", "accepted characters exceed the committed reply")
+            if confirmed_text:
+                with self.core.barrier.write_lock(self.character):
+                    if self.core.barrier.blocks_source_key(self.character, record.source_key):
+                        raise ApiError("deleted", "request result was invalidated")
+                    try:
+                        self.core.timeindex(self.character).add_qq_reply_parts(
+                            scope["session_id"], record.source_key, confirmed_text,
+                        )
+                        self.core.recent.add_qq_reply_parts(self.character, record.source_key, confirmed_text)
+                    except ValueError as exc:
+                        raise ApiError("request_conflict", str(exc)) from exc
             payload.update(transport=transport, parts=accepted, sent_chars=sent_chars)
         with self._lock:
             previous = self._load()["receipts"].get(receipt_id)

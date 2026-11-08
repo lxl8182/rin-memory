@@ -1542,6 +1542,20 @@
         <footer class="card-f"><a data-nav="publish" href="#publish">发布与生效 →</a><a data-rollback="6">回滚到第 6 版</a></footer>
       </div>
     </div>
+    <div class="panel" id="qqPersonaPanel" style="margin-top:16px" hidden>
+      <header class="card-h"><h2 data-en="QQ PERSONA">QQ 好友私聊人设</h2><span class="hint" id="qqPersonaStatus" role="status">读取中</span></header>
+      <form class="cfg" id="qqPersonaForm">
+        <div class="field">
+          <label for="qqPersonaText">公开人设</label>
+          <textarea id="qqPersonaText" rows="7" maxlength="8000" placeholder="留空时使用 QQ 预设中的铃芽人设" disabled></textarea>
+          <p class="note">所有好友私聊共用这份人设。可以写铃芽的身份、说话习惯和相处方式。保存后从下一轮好友私聊开始使用。</p>
+        </div>
+        <div class="detail-act">
+          <button class="btn pri" id="qqPersonaSave" type="submit" disabled>保存私聊人设</button>
+          <button class="btn" id="qqPersonaReload" type="button">重新读取</button>
+        </div>
+      </form>
+    </div>
   </section>
 
   <!-- ================= 发布 ================= -->

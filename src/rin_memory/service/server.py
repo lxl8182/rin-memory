@@ -163,6 +163,7 @@ def _messages(body: Mapping[str, Any], *, required: bool = True) -> list[dict]:
 def _build_turn_request(
     service: MemoryService, body: Mapping[str, Any],
     scope: Mapping[str, Any] | None = None,
+    *, external: bool = False,
 ) -> TurnRequest:
     """One turn request, with the caller's subject/scene when supplied (R03).
 
@@ -196,6 +197,7 @@ def _build_turn_request(
         occurred_at=_optional_str(body, "occurred_at"),
         client_id=str(scope.get("client_id") or ""),
         context_receipt_id=_optional_str(body, "context_receipt_id"),
+        reply_transport="qq" if external and body.get("reply_transport") == "qq" else "",
     )
 
 
@@ -345,16 +347,28 @@ class MemoryApi:
         context = self._scope.context_result
         persona_text = context["persona"]
         memory_block = context["context"].get("context") or ""
+        selected = (context["context"].get("selection") or {}).get("items") or ()
+        originals = [item["text"] for item in selected if item["kind"] == "original"]
+        if originals:
+            memory_block = "\n".join(item["text"] for item in selected if item["kind"] != "original")
         corrections = context["corrections"]["block"]
         awareness = (context.get("memory_awareness") or {}).get("text", "")
-        system = "\n\n".join(part for part in (persona_text, awareness, corrections, memory_block) if part)
+        state = context["state"].get("block", "")
+        restrictions = context.get("mention_preferences") or []
+        mention_block = "禁止提及：" + "、".join(restrictions) if restrictions else ""
+        system = "\n\n".join(part for part in (
+            persona_text, awareness, corrections, mention_block, state, memory_block,
+        ) if part)
         history = [
             {"role": "assistant" if item.get("type") == "ai" else "user",
              "content": str((item.get("data") or {}).get("content") or "")}
             for item in [*context["recent_turns"], *messages]
             if isinstance(item, Mapping)
         ]
-        payload = [{"role": "system", "content": system}, *history]
+        payload = [{"role": "system", "content": system}]
+        if originals:
+            payload.append({"role": "user", "content": "以下是检索到的历史对话引用，供当前问题查阅。\n" + "\n".join(originals)})
+        payload.extend(history)
         started = time.perf_counter()
         try:
             reply = await model.invoke(
@@ -420,6 +434,7 @@ class MemoryApi:
 
     def health(self) -> dict[str, Any]:
         state = self._service.state.to_dict()
+        state["memory_enabled"] = self._service.settings.memory_enabled
         state["background"] = self._service.background_status()
         state["character"] = self._service.settings.character
         if getattr(self, "instance_id", ""):
@@ -444,11 +459,22 @@ class MemoryApi:
         scope = self.protocol.scope(body)
         from .protocol import scene_object
         basis = self.protocol.basis()
+        from ..domain.recall import selection_recent
+        text = _optional_str(body, "text")
+        recent = selection_recent(body.get("recent_turns"), text)
+        segment, topic_handoff = [], False
+        if service.settings.memory_enabled:
+            segment, topic_handoff = self.protocol.segment_history(scope, body.get("segment_history"))
+        if service.settings.memory_enabled and not recent and scope["session_id"]:
+            recent = self.protocol.recent_for_selection(scope)
         recall = await service.core.recall.build_turn_context(
-            service.settings.character, current_input=_optional_str(body, "text"),
-            recent_turns=body.get("recent_turns"), subject=scope["subject"],
+            service.settings.character, current_input=text,
+            recent_turns=recent, subject=scope["subject"],
             scene=scene_object(scope["scene"]), budget_ms=service.settings.context_budget_ms,
+            segment_history=segment if topic_handoff else (),
         )
+        if segment and not topic_handoff:
+            recall["segment_sources"] = [row["source_key"] for row in segment]
         if basis != self.protocol.basis():
             raise ApiError("context_stale", "memory changed while context was being built")
         return self.protocol.issue(scope, recall, basis=basis)
@@ -523,7 +549,7 @@ class MemoryApi:
         generation = self._admit()
         try:
             scope = self._begin_scope(**self.protocol.scope(body))
-            request = _build_turn_request(service, body, scope)
+            request = _build_turn_request(service, body, scope, external=True)
             existing = service.core.turn_requests.get(service.settings.character, request.request_id)
             self._check_record_scope(existing, scope)
             if not existing or existing.status not in ("committed", "deleted"):
@@ -546,6 +572,8 @@ class MemoryApi:
             with self.protocol.ingest_slot(request.source_key, scope), self.protocol.session(scope):
                 outcome = await self._turn_service().commit_external(request, reply)
             self._check_generation(generation)
+            if outcome.status == "committed" and body.get("memory_selection_adopted") is True:
+                self.protocol.adopt_references(scope, request.request_id)
             return _outcome_payload(outcome)
         finally:
             self._end_scope()
@@ -817,6 +845,15 @@ class MemoryRequestHandler(BaseHTTPRequestHandler):
             return False
         identity = management.identity(self.headers.get("X-Companion-Client", ""),
                                        self.headers.get("X-Companion-Token", ""))
+        if path == "/v1/qq/persona" and method == "GET":
+            result = management.qq_persona()
+            subject = parse_qs(parsed.query).get("subject", [""])[0]
+            if subject:
+                from ..invalidation import is_friend_subject
+                result["memory_allowed"] = is_friend_subject(subject) and subject in identity["subjects"]
+                result["memory_enabled"] = self.api._service.settings.memory_enabled
+            self._send(200, result)
+            return True
         if path in ("/v1/proactive/poll", "/v1/proactive/observe",
                     "/v1/proactive/complete", "/v1/proactive/release", "/v1/proactive/check", "/v1/proactive/use"):
             management.require_memory_outputs(identity)

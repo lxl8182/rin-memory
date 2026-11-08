@@ -1,6 +1,6 @@
-# 铃芽 RIN 管理台：新实例启动与接口
+# 铃芽 RIN 管理台与客户端合同
 
-更新：2026-10-24。S05 服务侧与非宿主闭环已完成，版本 `0.1.0.dev2`。独立服务持有唯一核心和维护循环，水彩管理台由同一个进程托管；宿主接入继续按 S05 的 A/C/D 推进。
+管理台由独立服务同源托管。本文维护操作入口和 HTTP 字段。完整记忆行为见 [记忆流程](memory-flow.md)，部署及验收状态见 [维护台账](roadmap.md)。
 
 ## 1. 启动与初始化
 
@@ -13,21 +13,13 @@
 .\tools\stack.ps1 stop -Config F:\game\projectNEKO\companion-runtime\config\stack.toml
 ```
 
-默认打开 [管理台](http://127.0.0.1:48931)。空库先填写显示名与初始人格，再首次发布；身份段默认冻结自动演化，人工编辑仍可进行。稳定 `character_id` 来自新配置。显示名是人格卡身份段（`identity`）的第一行，固定写成 `名字: <名字>`，后面接昵称、性别、年龄等描述；管理台人格卡编辑器、初始引导和宿主角色卡改名写的都是这一行。编辑身份正文时若漏掉名字行，服务会自动把原名字行补回首行，因此不会因为改正文而丢名字。游戏侧读取人格卡作为角色设定，不再使用 `characters.json` 的资料字段。旧版本留下的 `service_character.json` 只在启动时一次性并入人格卡（卡上已有名字时段落优先），并入成功后删除该文件。重复 init 或创建请求保留已有配置、人格与显示名。
+默认打开 [管理台](http://127.0.0.1:48931)。空库先填写显示名与初始人格，再首次发布；身份段默认冻结自动演化，人工编辑仍可进行。稳定 `character_id` 来自栈配置。显示名是人格卡身份段（`identity`）的第一行，固定写成 `名字: <名字>`，后面接昵称、性别、年龄等描述；管理台人格卡编辑器、初始引导和宿主角色卡改名写的都是这一行。编辑身份正文时若漏掉名字行，服务会自动把原名字行补回首行，因此不会因为改正文而丢名字。游戏侧读取人格卡作为角色设定，不再使用 `characters.json` 的资料字段。旧版本留下的 `service_character.json` 只在启动时一次性并入人格卡（卡上已有名字时段落优先），并入成功后删除该文件。重复 init 或创建请求保留已有配置、人格与显示名。
 
 发布页的使用方状态是唯一提示位置：顶部导航不再有发布小圆点，`chat`（管理台自己的对话）显示为“本机对话”，因为它每轮直接读取当前发布版本，不参与采用流程；只有真正接入的外部使用方（如 `neko_chat`）才会显示“待生效”。
 
 `stack.toml` 的路径相对其所在目录解析，`runtime.python` 为绝对解释器，`runtime.package_version` 固定安装版本。memory/host/logs/state 必须互不嵌套且位于源码仓库之外。`models.service` 的 `api_key_env` 填环境变量名；缺模型时管理功能保持可用，状态/设置页列出需要填写的字段。模型与凭据填好后重启。演化从 off 开始，propose/auto 由管理台显式选择并持久保存。
 
-N.E.K.O 文字接线已启用。模板默认 `host.enabled=false`；填写 `host.source`（带 `companion_host.py` 的源码目录）、`host.python` 和 `host.client_id`，并配置同名 `clients` 身份后设为 true。新入口先启动记忆服务，再启动宿主；状态显示各自实例，日志分别为 `memory-service.log` / `neko-host.log`。`host.port/memory_port/tool_port/plugin_port` 默认 48911/48912/48915/48916。宿主文字模型默认沿用服务 conversation；填写 `models.host.base_url/conversation` 时改用该组配置和其 `api_key_env`。`presentation.live2d_model` 相对新 host 根的 live2d 目录。当前文字验收关闭 TTS，语音与主动/实时/游戏消费继续推进。
-
-宿主数据、配置、插件状态与启动锁写入新 host 根；不探测旧锚点、不导入旧角色与旧记忆。复用模型素材时只复制所选资源。生成前固定已发布人格与删除/更正依据；生成后完整轮次写入宿主有界队列，先持久保存再上传。服务已落盘但响应丢失时同键重放，不再次生成或播放。N.E.K.O 页面实际收到完整文本后回报显示回执；此回执描述文字显示，语音播放回执待语音接线。使用方 `neko_chat` 与管理台 `chat` 分开显示。宿主的记忆管理页面跳转到同一个铃芽管理台。
-
-服务故障时暂停新的文字生成，页面给出记忆服务不可用提示；已生成轮次由后台定时补交。删除或更正使依据失效时丢弃关联待同步正文，只留请求标识与错误码。人格编辑与发布现在两端同一张卡：铃芽管理台与宿主角色设置都读写服务的当前人格。宿主客户端需在 `stack.toml` 显式配置 `host_persona = true`（默认关闭）才可使用 §2.3 的三个 `/v1/host/persona` 端点；宿主页面按段落编辑、分开保存草稿与发布，冲突保留草稿并显示服务当前 revision，服务不可用时保存失败而不会写入本地替代人格。宿主生成的对白仍以 `neko_chat` 记录采用与显示，主动文字用 `neko_active`，两者互不覆盖。
-
-重复 start 返回同一实例。端口被其他进程占用时直接报 `service.port` 冲突。启动失败查 `logs/memory-service.log`；status 显示配置、根、PID、实例、各能力与积压。停止先关闭 HTTP 入口、排空工作及维护循环，再释放根锁并写 `state/stack.json` 的退出结果。无法联系的实例返回 unreachable，启动器不会凭旧 PID 结束无关进程。
-
-服务从已安装的 wheel 加载 HTML、JS、CSS、图片，子进程工作目录在新 state 根；无需源码目录。`tools/stack.ps1 -Python <解释器>` 和安装命令 `rin-stack` 支持其他明确的安装位置。开发用 `webui/server.py --demo` 继续用于隔离样稿/接口测试，不作为新系统日常入口。
+工作区的 N.E.K.O 文字宿主与管理台使用同一个服务。宿主启动、运行根和版本钉住见 [独立服务](standalone-service.md)。宿主作为单独使用方显示其采用与送达状态。
 
 ## 2. 服务管理合同
 
@@ -146,18 +138,36 @@ plugin_id = 'game_plugin'
 | GET `/v1/memory/entries` | 客户端需显式授予 `memory_tools = true`；仅列其授权 subject 的 fact/reflection，可按 text 筛选 |
 | POST `/v1/memory/correct` | 同上；subject、old_text/new_text 和稳定 request_id，复用核心更正规则，写入共享的个人范围 |
 | POST `/v1/memory/forget` | 同上；target（fact/reflection 的 type/id）必须属于该 subject；text 多条匹配返回 409/ambiguous_target；source_key 必须属于该角色/主体和客户端绑定插件；episode 删除走管理台 |
-| GET `/v1/host/persona` | 需该客户端在 `stack.toml` 中配置 `host_persona = true`；返回当前卡的 `revision/initial_revision/sections`（含 section_id/kind/scope/editable_by/frozen）与 `published`（version/revision/target/published_at/stale） | 只读；无授予 403，console 标志不等于该能力 |
-| POST `/v1/host/persona` | `base_revision` + `operations`（op=add/replace/merge/delete、section_id、text）；按 CAS 修订 | 冲突 409 且回传 `current`（服务当前卡）；拒绝 422；不代替调用方重读最新 revision |
-| POST `/v1/host/persona/publish` | `revision`（编辑器看到的版本）与 `target`（仅 `next_turn`）；发布后下一轮采用，在途轮次不切换 | 旧 revision 409；非 `next_turn` 400 |
+| GET `/v1/host/persona` | 需该客户端在 `stack.toml` 中配置 `host_persona = true`；返回当前卡的 `revision/initial_revision/sections`（含 section_id/kind/scope/editable_by/frozen）与 `published`（version/revision/target/published_at/stale）。无授权返回 403 |
+| POST `/v1/host/persona` | `base_revision` + `operations`（op=add/replace/merge/delete、section_id、text）；按 CAS 修订。冲突 409 并返回 `current`，拒绝 422 |
+| POST `/v1/host/persona/publish` | `revision`（编辑器看到的版本）与 `target`（仅 `next_turn`）；发布后下一轮采用，在途轮次不切换。旧 revision 返回 409，非法 target 返回 400 |
 | GET `/v1/cleanup/pending` | 已绑定 plugin_id 查询待清理来源；memory_ids 与 persona_versions 标识受影响的记忆和失效发布版本，供插件清理已登记的上下文副本；重连后继续返回未确认任务 |
 | POST `/v1/cleanup/{deletion_id}/ack` | plugin_id、status=cleaned/failed、cleaned/failed 列表；completed 是 cleaned 的别名；不得确认其他插件的任务 |
 | GET `/v1/cleanup/receipts/{id}` | console 查询删除状态与各清理步骤 |
 | POST `/v1/cleanup/retry`、`/retract-correction` | console 按 deletion_id 重试清理（force=true 可重做已完成步骤），或按 correction_id 撤回更正；页面有对应操作 |
 | POST `/v1/maintenance` | console 手动执行一轮维护；设置页可调用；返回每个步骤状态和积压 |
 
+启用记忆的 QQ 私聊可在 `POST /v1/context` 提交 `segment_history`，含 `mode`（`budget` 或 `topic`）与最多 30 条 `exchanges`（`source_key`、`user`、`reply`）。核心按认证主体、插件场景及来源账本过滤，返回 `context.segment_sources`、可选 `segment_anchors` 和 `segment_detail`。预约时在 `consumer_refs.source_ids` 中提交计划带入的键，服务只登记签发范围内的来源。
+
+### 2.4 普通聊天的选择与采用
+
+`context.selection` 包含 `version/status/items`。`version: 1` 的条目带原记录 `id`、稳定 `key`、正文和 `source_keys`。聊天用召回、工作摘要和经历投影共用这份选择，管理台查询仍可查看完整记录。
+
+| 状态 | 含义 |
+|---|---|
+| `selected` / `empty` | 有入选材料 / 正常无入选 |
+| `unavailable` / `timed_out` / `invalid_output` | 筛选不可用、超过预算或返回不合法 |
+| `disabled` / `superseded` | 记忆暂停，或上下文在构建时已失效 |
+
+`superseded` 描述核心内部的旧结果。HTTP 层发现依据变化时可直接返回 `409/context_stale`，客户端需重新请求上下文。
+
+预约提交 `consumer_refs.selection_version: 1` 及 `memory_ids/source_ids` 两个数组时，服务器只接受已签发集合的子集。显式空数组保持为空。旧客户端沿用保守登记方式。预约先保留清理依据；DSH 在材料进入会话后随 `POST /v1/turns` 提交 `memory_selection_adopted: true`，服务将对应预约标为已采用。
+
 used 必须对应已提交的生成，delivered 必须在实际显示/播放后上报；读取上下文不建立使用记录。receipt_id 同键同内容幂等，异内容为 409；回执随 journal 恢复，删除后审计标记 invalidated。服务保留最近 2,048 条消费回执，聊天页 sessionStorage 保存待重试请求键与草稿。
 
-sent 只表示平台接收，不表示用户已读。分批接受的 QQ 分段使用各自稳定回执键，重试不重复计数。私人 QQ 聊天提交时明确 `applies_to = 'shared'`，保持 plugin scene 作为来源，避免把普通个人喜好限定到该插件。
+sent 表示平台接收。分批接受的 QQ 分段使用各自稳定回执键，重试不重复计数。QQ 轮次提交 `reply_transport: "qq"` 时，发送回执用 `parts[].index` 和 `parts[].text` 逐段补齐对话原话。生成结果保存在轮次记录，回执查询只返回元数据。私人 QQ 聊天提交时明确 `applies_to = 'shared'`，保持 plugin scene 作为来源，个人喜好可跨场景使用。
+
+管理台「人格卡 → QQ 好友私聊人设」通过 `POST /v1/qq/persona` 保存 `text` 和 `base_revision`。已认证客户端可用 `GET /v1/qq/persona` 读取公开人设。携带好友 `subject` 时同时返回该客户端对该主体的记忆授权和服务记忆开关状态。
 
 时间流只将明确的 `game:<game_id>` 场景归为“游戏”。`plugin:dsh_memory` 显示为“DSH 对话”，其它插件场景显示为“插件会话 · <plugin_id>”，均归入“对话”；插件来源本身不作为游戏分类依据。该规则同时用于列表、筛选计数和详情，已有记录按来源直接显示。
 
@@ -171,97 +181,13 @@ N.E.K.O 文字客户端的 system 只包含固定宿主规则与本轮采用的�
 
 ---
 
-## 3. 目录现状
+## 3. 前端入口
 
-```
-webui/
-├─ server.py                     # API + 静态服务（stdlib）
-├─ seed.py                       # 演示数据种子与 live 核心构造
-├─ testbed/                      # C04 独立测试前端（index.html / app.js / style.css）
-├─ tests/test_testbed_api.py     # 6 个 HTTP 验收用例
-└─ designs/tidebell/
-   ├─ index-watercolor.html      # 唯一保留的设计稿
-   ├─ live.js                    # 实时层
-   ├─ motion.css / motion.js     # 风铃与海面动效（可被 body.calm 关闭）
-   └─ assets/
-      ├─ rin-logo-refined.svg    # 品牌标（同时用作 favicon）
-      ├─ xiaofeiyu-portrait.png  # 概览角色头像（名字由 API 覆盖）
-      ├─ sakura-wave.png         # 页脚樱花枝
-      └─ motion/                 # 海面、风铃、花瓣、纸纹、页脚水波
-```
+水彩管理台在 [webui/designs/tidebell](../webui/designs/tidebell/)，页面入口为 `index-watercolor.html`，HTTP 数据与交互由 `live.js` 接入。`webui/server.py` 提供同源页面及只读或演示入口，`webui/testbed` 是独立测试页。
 
-已删除：其余 9 套设计稿（cinematic / hoshikuzu / lightnovel / magical / manga / moss / neon / tsukishiro / vinyl）、`designs/index.html` 画廊页、旧版 `designs/tidebell/index.html`、`PROMPTS.md`、`webui/index.html` 与 `webui/assets/**`、以及未引用的候选图与花铃素材。
+## 4. 运行边界
 
-改这些删除的原因：管理台只保留一个前端，避免同一份 API 对应多套页面、也避免 `webui/assets` 与 `designs/**` 两套美术资源同时存在。`/testbed/` 是 C04 的可测试前端且被测试覆盖，保留。
-
----
-
-## 4. 设计评审
-
-### 4.1 总评
-
-视觉 8.5 / 信息架构 8 / 交互 7.5 / 产品完成度 7。
-
-做得好的：
-
-- **页头是整套设计的灵魂**：海面、樱花、风铃、RIN 三段关键词、品牌句与定位句压在一个紧凑高度里，插画完整，信息也完整。
-- **字体有分工**：Bookman 斜体做眉题与数字，楷体做品牌句、解释与落款，宋体做标题，互不抢戏。
-- **导航稳定**：两字标签 + 固定左侧「铃芽」+ 吸顶导航与吸顶页头，切换页面时标签不再左右跳。
-- **概览的数据表达**：五格统计 + 21 天潮位图，数字大、标签小，今天单独用粉色标出。
-- **人格页结构成熟**：左侧语义段落按类别分色，右侧修订历史 + diff，主操作在页头右侧。
-- **页脚克制**：低矮落款 + 水波 + 右上角贴边樱花枝。
-- **真实 API 已接上**：九个页面都能读真实快照，主要写操作都有真实回执。
-
-### 4.2 P0
-
-1. **移除设计预览顶栏。**（已做）原顶栏 `← 返回方案选择 | 2026.10.23 · 霜降 | 角色 小肥鱼 ▾ | 引擎运行中` 是设计画廊的壳，且 `../index.html` 已不存在。现在只留一行状态：`本地记忆 · 只读/可写 · 角色 小铃`，由 `meta` 驱动；重复的「引擎运行中」已删除。
-2. **统一「角色 / 系统」的身份层级。** 页头是「铃芽 RIN」（产品），概览卡是角色名（已由 API 的 `meta.character` 驱动，真实根显示「小铃」），人格正文可能自称别的名字。需要在文案上定死：铃芽 RIN 是记忆系统，角色名是它管理的对象。头像按约定固定使用 `assets/xiaofeiyu-portrait.png`，不随角色名变化。
-3. **无变化提案。**（已做）概览卡片只显示「驳回这条空提案」，演化详情隐藏「采纳」并给出说明。剩下的根治建议是数据层直接过滤 `operation.text === 当前段落` 的提案。
-
-### 4.3 P1
-
-4. **2560 尺度。**（已做）新增 `@media (min-width:2200px)`：shell 2040px、页头 300px、插画 672px、RIN 关键词 30px、导航 56px；吸顶偏移改用 `--nav-h` 变量自动跟随。
-5. **清理页太长。**（部分已做）已有类型筛选与每页 10 条分页、删除链接改为危险色。仍建议补一个搜索框，并把右栏「已完成」在长列表下做成 sticky 或抽屉。
-6. **发布页可读性。**（部分已做）令牌改为前 8 位 + 悬停看全值，措辞改为「使用方」。仍建议给令牌加复制按钮，并在「0/4 已生效」旁补一句等待边界。
-7. **设置页语义耦合。**（已做）开关与模式现在互相同步并附带一行说明；剩下的是给「显示」分组标注「仅影响当前页面」。
-
-### 4.4 视觉细节
-
-8. **页头插画左边缘偏硬。**（已做）渐变遮罩从 15% 提到 18%，大屏 18%。
-9. **头像风格。** 头像按约定固定为 `xiaofeiyu-portrait.png`，不再替换；若要更贴合水彩，可只加一层柔边/纸张滤镜，不改图。
-10. **小字对比度。**（已做）`--ink-3` 由 `#6d6355` 压到 `#655b4e`，`--ink-4` 由 `#8b8172` 压到 `#7d7365`。
-11. **红色强调过多。**（已做）导航品牌红点改为中性白点，只保留当前 tab 下划线与预警用的金色圆点。
-12. **文案小修。**（已做）「主角色」→「当前角色」、「投影待同步」→「待同步到下一轮对话」、「消费者」→「使用方」。
-13. **资源体积。** 首屏图 `assets/motion/seaside-background.png`（约 1.9MB）与风铃素材合计约 9MB。建议转 WebP/AVIF，页头图 `fetchpriority="high"`，页脚与背景图 `loading="lazy"`。
-14. **响应式。**（已做）≤1520px 时 RIN 改为压缩排版（关键词 18px、英文 11px），不再整块隐藏。
-15. **性能观察。** C05 记录 `snapshot` HTTP p50/p95 ≈ 618/662ms（真实根更大时会更慢）。页面目前每次写操作后整页重拉，若体感变慢，可考虑局部刷新或加短缓存。
-
-### 4.5 本轮已落地的优化
-
-- 页头 RIN 三段删掉后面的解释小字，只留「记忆召回 / 人格身份 / 养成培育」，字号放大到 26px（1920）/ 18px（≤1520），英文 14px；≤1520 不再整块隐藏，改为压缩排版（定位句在该档隐藏）。
-- 新增 `@media (min-width:2200px)` 断点：shell 2040px、页头 300px、插画 672px、RIN 关键词 30px、导航 56px，并用 `--nav-h` 变量让吸顶偏移自动跟随。
-- 页头插画左缘渐变遮罩从 15% 提到 18%，大屏 18%。
-- `--ink-3` / `--ink-4` 各压深一档，小字对比度提高。
-- 导航左侧的品牌红点改为中性白点，只保留当前 tab 下划线作为主强调。
-- 概览的「主角色 · 投影待同步」改为「当前角色 · 待同步到下一轮对话」。
-- 面向用户的「消费者」统一改为「使用方」。
-- 版本令牌在表格与 token 行只显示前 8 位，完整值放在 `title` 悬停提示。
-- 清理页新增类型筛选（全部 / 反思 / 事实 …）与每页 10 条的「再看 N 条」分页，删除链接改为危险色。
-- 无变化提案：概览卡片只给「驳回这条空提案」，演化详情隐藏「采纳」并显示说明文字。
-- 设置页的「后台自动演化」开关与「关闭 / 提议 / 自动」chips 联动：关开关同时置 off，选 off 同时关开关，选提议/自动时自动开启。
-
-### 4.6 剩余优先级
-
-1. 数据层过滤无变化提案，而不是只在 UI 隐藏「采纳」。
-2. 清理页补搜索框；长列表下右栏改 sticky 或抽屉。
-3. 首屏图转 WebP/AVIF 并加 `fetchpriority`；页脚图 `loading="lazy"`。
-
----
-
-## 5. 已知边界
-
-- 服务只监听回环，没有鉴权与 CSRF 防护；不要用 `--host 0.0.0.0` 暴露到局域网。
-- `--memory-root` 只读模式下的所有写按钮都会返回 403，这是保护而非 bug。
-- 同一数据根同时只允许一个写者：宿主引擎在跑时不要再加 `--allow-write`。
-- 角色自动识别只在根下恰好一个角色目录时生效，多角色根请显式 `--character`。
-- 删除与更正走引擎并生成墓碑；删除后同一来源不会因重放复活，这条已有测试覆盖。
+- 正式栈使用回环地址、客户端认证和 Host/Origin 校验。生产数据由独立服务单写。
+- 只读模式可以查记录，写入返回 403。创建、发布、回滚、清理及模型配置使用管理身份。
+- 人格、事实和派生数据的变更走服务合同。审计使用稳定 ID 和回执。
+- 早期视觉评审和测试页决策见 [整理前原稿](https://github.com/lxl8182/rin-memory/blob/0ee569e21d788076389211e4fada827c8e4631c7/docs/webui-console.md)。

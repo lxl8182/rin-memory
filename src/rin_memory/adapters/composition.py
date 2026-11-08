@@ -455,6 +455,7 @@ class MemoryCore:
         result = self.sink.recover(character)
         if not getattr(result, "paused", False):
             self.persona_teaching.retry_pending(character)
+            self.correction_service.repair_replacements(character)
         try:
             self.turn_requests.mark_interrupted_pending(character)
         except Exception:  # noqa: BLE001 - recovery must not fail on bookkeeping
@@ -817,11 +818,13 @@ def build_memory_core(
         barrier=barrier,
         token_counter=token_counter,
         embedding=embedding_provider,
+        model=model,
         settings=recall_settings,
         roots=roots,
         state=state_service,
         working_summary=working_summary,
         interests=interests,
+        timeindex_factory=timeindex_factory,
     )
     # B07: outbox dispatch + one maintenance round; no background task is
     # started here (the standalone entry / host supervisor owns scheduling).
@@ -834,6 +837,7 @@ def build_memory_core(
         result = sink.recover(character)
         if not getattr(result, "paused", False):
             persona_teaching.retry_pending(character)
+            correction_service.repair_replacements(character)
         return result
 
     maintenance = MaintenanceService(
@@ -855,6 +859,7 @@ def build_memory_core(
         # a maintenance round.
         proactive=proactive_service,
     )
+    extraction.notify_priority = maintenance.wake
     from ..persistence.consumer_receipts import ConsumerReceiptStore, RECEIPT_EVENT
     consumer_receipts = ConsumerReceiptStore(roots=roots, store=store, permit=permit)
     journal.register_handler(RECEIPT_EVENT, consumer_receipts.replay)

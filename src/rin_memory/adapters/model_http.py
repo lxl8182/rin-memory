@@ -29,10 +29,17 @@ import json
 import os
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
+
+# A short-lived HTTP event loop must be able to return after timing out.
+# The worker keeps its slot until urllib actually finishes.
+_MODEL_WORKERS = ThreadPoolExecutor(thread_name_prefix="rin-model")
+
 
 #: Failure kinds the service maps onto HTTP status / capability state.
 ERROR_KINDS = frozenset({
@@ -218,48 +225,41 @@ class HttpModelInvoker:
             "stream": False,
         }
         payload.update(self._settings.provider_options())
-        deadline = max(0.1, float(timeout_s or self._settings.timeout_s))
-
-        # Acquire off the event loop: `acquire` is blocking, and the whole point
-        # of the bound is that a queued call waits without holding a coroutine.
-        acquired = await asyncio.to_thread(self._slots.acquire, True, deadline)
-        if not acquired:
-            raise ModelCallError(
-                f"no model slot within {deadline:.1f}s "
-                f"(capacity {self.capacity})", kind="rate_limit", retryable=True,
-            )
-        with self._guard:
-            self._in_flight += 1
+        budget = float(timeout_s if timeout_s is not None else self._settings.timeout_s)
+        deadline = time.monotonic() + budget
         try:
             return await asyncio.wait_for(
-                asyncio.to_thread(
-                    self._call_with_slot, payload, key, deadline, purpose,
+                asyncio.get_running_loop().run_in_executor(
+                    _MODEL_WORKERS, self._call_with_slot, payload, key, deadline, purpose,
                 ),
-                timeout=deadline,
+                timeout=budget,
             )
         except asyncio.TimeoutError as exc:
-            # The worker still holds its slot and will release it when urllib
-            # returns, so the bound is never exceeded; the call is only
-            # reported as abandoned.
             self._abandoned += 1
             raise ModelCallError(
-                f"model call exceeded {deadline:.1f}s", kind="timeout",
-                retryable=True,
+                f"model call exceeded {budget:.2f}s", kind="timeout", retryable=True,
             ) from exc
         except asyncio.CancelledError:
             self._abandoned += 1
             raise
 
     def _call_with_slot(
-        self, payload: Mapping[str, Any], key: str, timeout: float, purpose: str,
+        self, payload: Mapping[str, Any], key: str, deadline: float, purpose: str,
     ) -> str:
-        """Run the request and release the slot from the worker itself."""
+        """The worker owns the slot throughout queueing, I/O and release."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self._slots.acquire(timeout=remaining):
+            raise ModelCallError("model slot deadline exceeded", kind="timeout", retryable=True)
+        with self._guard:
+            self._in_flight += 1
         try:
-            return self._post(payload, key, timeout, purpose)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ModelCallError("model slot deadline exceeded", kind="timeout", retryable=True)
+            return self._post(payload, key, remaining, purpose)
         finally:
             with self._guard:
-                if self._in_flight > 0:
-                    self._in_flight -= 1
+                self._in_flight -= 1
             self._slots.release()
 
     # -- transport (runs in a worker thread) ----------------------------

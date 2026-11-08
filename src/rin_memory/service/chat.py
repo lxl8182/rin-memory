@@ -186,7 +186,7 @@ class ChatBridge:
         provider, so the console's one configuration would silently apply to
         half the system.
         """
-        for name in ("extraction", "compression", "reflection_service",
+        for name in ("extraction", "recall", "compression", "reflection_service",
                      "evolution_service", "persona_service"):
             holder = getattr(self._core, name, None)
             if holder is not None and hasattr(holder, "_model"):
