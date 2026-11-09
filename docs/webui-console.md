@@ -144,6 +144,7 @@ plugin_id = 'game_plugin'
 | GET `/v1/cleanup/pending` | 已绑定 plugin_id 查询待清理来源；memory_ids 与 persona_versions 标识受影响的记忆和失效发布版本，供插件清理已登记的上下文副本；重连后继续返回未确认任务 |
 | POST `/v1/cleanup/{deletion_id}/ack` | plugin_id、status=cleaned/failed、cleaned/failed 列表；completed 是 cleaned 的别名；不得确认其他插件的任务 |
 | GET `/v1/cleanup/receipts/{id}` | console 查询删除状态与各清理步骤 |
+| GET `/v1/cleanup?receipts_only=1` | console 刷新清理回执，返回停止召回、本地清理和接入端确认状态 |
 | POST `/v1/cleanup/retry`、`/retract-correction` | console 按 deletion_id 重试清理（force=true 可重做已完成步骤），或按 correction_id 撤回更正；页面有对应操作 |
 | POST `/v1/maintenance` | console 手动执行一轮维护；设置页可调用；返回每个步骤状态和积压 |
 
@@ -176,6 +177,10 @@ N.E.K.O 文字客户端的 system 只包含固定宿主规则与本轮采用的�
 共同游戏经历的来源与适用范围分别保存：有相处意义的经历默认共享给普通聊天按需召回，仍保留游戏、局次、episode 和 source_key；明确的 game/run 范围继续生效。战术、构筑和临时安排仍由游戏插件管理。
 
 按 source_key 删除时同时清理 recent 原文、时间索引和 FTS；按事实条目删除保留无关的原始对话。清理器先去掉已被屏障覆盖的窗口内容，避免另一项待清理来源阻塞本次清理与后续聊天。新轮上下文也经过屏障过滤。
+
+管理台向 `POST /v1/cleanup/delete` 提交 `defer_cleanup: true`。服务持久写入删除屏障后返回 202，随后继续清理。本地数据与接入端副本分别确认，管理台轮询清理回执。省略该字段时沿用同步响应。
+
+按事实 ID 删除时，只有登记过该条记忆的接入端收到副本清理待办。事实所引用的原话保留；按来源或整段经历删除时，才按来源定位聊天副本。
 
 `service.max_pending_events` 默认 1,024；chat/turns/events 共用容量并为在途输入预留位置，满额返回 429，已提交回放继续可用。HTTP、模型并发和超时分别沿用 stack 配置；容量拒绝不进入等待队列，所以 chat 的 queue_ms 为 0。
 

@@ -5,7 +5,7 @@ Python 导入名 `rin_memory`，CLI `rin-memory` / `rin-memory-run` / `rin-stack
 DSH 接入端是旁边的 `dsh-rin-memory`（npm `@local/dsh-rin-memory`）。
 
 - 最后更新：2026-11-07
-- 当前版本：`0.1.0.dev18`（`pyproject.toml`）
+- 当前版本：`0.1.0.dev19`（`pyproject.toml`）
 - 进度只在本仓库 `docs/roadmap.md` 维护；本文件只写**长期有效的结构、边界和做法**。
 
 ---

@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from rin_memory.adapters.composition import build_memory_core
-from rin_memory.contracts import DeletionRequest, MemoryEvent, Scope
+from rin_memory.contracts import DeletionRequest, DeletionTarget, MemoryEvent, Scope
 from rin_memory.errors import (
     BarrierStaleError, CorruptStoreError, DeletionNotFoundError,
     InvalidSchemaError, WriteRejected,
@@ -115,6 +115,20 @@ class DeletionFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rejected.status, "rejected")
         self.assertEqual(rejected.reason, "deleted_source")
         self.assertTrue(rejected.durable)
+
+    async def test_deleting_an_unconsumed_fact_keeps_its_plugin_source(self):
+        source = "plugin:dsh_memory:demo:private:s1:origin"
+        await self.core.sink.append(event(source, "原来的对话"))
+        self.core.facts.save("demo", [
+            {"id": "f1", "text": "原话派生的事实", "source_event_keys": [source]},
+        ])
+        receipt = await self.core.deletion_service.forget(DeletionRequest(
+            scope=Scope("demo"), targets=(DeletionTarget("fact", "f1"),),
+        ))
+        self.assertEqual(receipt.status, "completed")
+        self.assertEqual(self.core.facts.load("demo"), [])
+        self.assertEqual(self.core.ledger.count("demo"), 1)
+        self.assertFalse(self.core.deletion_service.pending_plugin_deletions("demo", "dsh_memory"))
 
     async def test_episode_deletion_cleans_original_rows_and_waits_for_plugin(self):
         index = self.core.timeindex("demo").open()

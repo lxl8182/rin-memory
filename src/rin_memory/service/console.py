@@ -544,8 +544,8 @@ class RinApp:
             "proposals": proposals,
         }
 
-    def _cleanup(self, load: Mapping[str, Any]) -> dict[str, Any]:
-        document = load["deletions"]
+    @staticmethod
+    def _deletion_rows(document: Mapping[str, Any]) -> list[dict[str, Any]]:
         deletions = []
         for row in document.get("deletions") or ():
             if not isinstance(row, Mapping):
@@ -573,13 +573,25 @@ class RinApp:
                 "created_at": row.get("created_at"),
                 "completed_at": row.get("updated_at") if status == "completed" else None,
                 "deletion_id": str(row.get("deletion_id") or ""),
+                "stopped_using": bool(row.get("stopped_using")),
+                "content_cleaned": bool(row.get("content_cleaned")),
                 "plugin_receipts": dict(row.get("plugin_receipts") or {}),
                 "steps": {
                     str(name): str((step or {}).get("status") or "")
                     for name, step in (row.get("steps") or {}).items()
                     if isinstance(step, Mapping)
                 },
+                "step_errors": {
+                    str(name): str(step["detail"]["error"])
+                    for name, step in (row.get("steps") or {}).items()
+                    if isinstance(step, Mapping) and isinstance(step.get("detail"), Mapping)
+                    and step["detail"].get("error")
+                },
             })
+        return deletions
+
+    def _cleanup(self, load: Mapping[str, Any], *, query: str = "") -> dict[str, Any]:
+        document = load["deletions"]
         corrections = []
         for row in load["corrections"]:
             if not isinstance(row, Mapping):
@@ -623,13 +635,13 @@ class RinApp:
                 "at": row.get("at"),
             })
         view = {
-            "deletions": deletions,
+            "deletions": self._deletion_rows(document),
             "corrections": corrections,
             "tombstones": tombstones,
         }
         try:
             result = self.core.deletion_service.deletable_entries(
-                self.character, limit=40,
+                self.character, query=query, limit=40,
             )
             view["deletable"] = list(result.get("items") or [])
         except Exception:  # noqa: BLE001 - cleanup stays readable without it
@@ -845,19 +857,14 @@ class RinApp:
             return self._evolution(self._load())
 
     def cleanup(self, query: Mapping[str, list[str]] | None = None) -> dict[str, Any]:
-        with self._lock:
-            view = self._cleanup(self._load())
-            query = query or {}
-            q = (query.get("q") or [""])[0].strip()
-            try:
-                result = self.core.deletion_service.deletable_entries(
-                    self.character, query=q, limit=40,
-                )
-                view["deletable"] = list(result.get("items") or [])
-            except Exception:  # noqa: BLE001 - cleanup stays readable without it
-                view["deletable"] = []
-            view["deletable_total"] = len(view["deletable"])
-            return view
+        query = query or {}
+        document = self.core.deletions.snapshot(self.character)
+        if query.get("receipts_only") == ["1"]:
+            return {"deletions": self._deletion_rows(document)}
+        return self._cleanup({
+            "deletions": document,
+            "corrections": self.core.corrections.all_entries(self.character),
+        }, query=(query.get("q") or [""])[0].strip())
 
     def state(self) -> dict[str, Any]:
         with self._lock:
@@ -1242,7 +1249,7 @@ class RinApp:
             "request_id": receipt.request_id,
         }
 
-    def cleanup_delete(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+    def cleanup_delete(self, payload: Mapping[str, Any], *, defer_cleanup: bool = False) -> dict[str, Any]:
         self._assert_writable()
         from rin_memory.contracts import (
             DeletionRequest,
@@ -1271,13 +1278,14 @@ class RinApp:
             raise ApiError("invalid_request", 400, "id is required with type")
 
         deletable: list[dict[str, Any]] = []
-        try:
-            result = self.core.deletion_service.deletable_entries(
-                self.character, limit=64,
-            )
-            deletable = [dict(item) for item in result.get("items") or ()]
-        except Exception:  # noqa: BLE001 - lookup is best-effort
-            deletable = []
+        if (target_id and not target_type) or (not target_id and text):
+            try:
+                result = self.core.deletion_service.deletable_entries(
+                    self.character, limit=64,
+                )
+                deletable = [dict(item) for item in result.get("items") or ()]
+            except Exception:  # noqa: BLE001 - lookup is best-effort
+                pass
 
         targets: list[Any] = []
         episode_ids: list[str] = []
@@ -1325,7 +1333,7 @@ class RinApp:
             request_id=(request_id or None),
         )
         with self._lock:
-            receipt = asyncio.run(self.core.deletion_service.forget(request))
+            receipt = asyncio.run(self.core.deletion_service.forget(request, defer_cleanup=defer_cleanup))
             return self._deletion_receipt_view(receipt)
 
     def evolution_propose(self, payload: Mapping[str, Any]) -> dict[str, Any]:

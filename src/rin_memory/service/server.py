@@ -982,6 +982,19 @@ class MemoryRequestHandler(BaseHTTPRequestHandler):
             elif method == "GET":
                 query = {key:[str(value)] for key,value in body.items()}
                 self._send(200, management.get(path, query))
+            elif path == "/v1/cleanup/delete" and body.get("defer_cleanup") is True:
+                management.check_scope(body)
+                receipt = management.console.cleanup_delete(body, defer_cleanup=True)
+                try:
+                    self._send(202, receipt)
+                finally:
+                    if not receipt["content_cleaned"]:
+                        try:
+                            _run(self.api._service.core.deletion_service.retry(
+                                management.console.character, receipt["deletion_id"],
+                            ))
+                        except Exception as exc:  # response already sent; the durable receipt is retryable
+                            self.log_error("deletion cleanup %s: %s", receipt["deletion_id"], type(exc).__name__)
             else:
                 self._send(200, management.post(path, body))
         finally:

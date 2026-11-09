@@ -1114,9 +1114,15 @@ class ManagementApi:
                 status = "cleaned"
             if status not in ("cleaned", "failed") or not payload.get("plugin_id"):
                 raise ApiError("invalid_argument", 400, "plugin_id and a valid status are required")
+            cleaned = payload.get("cleaned", [])
+            failed = payload.get("failed", [])
+            if isinstance(cleaned, list):
+                cleaned = [item.get("session_id") if isinstance(item, Mapping) else item for item in cleaned]
+            if isinstance(failed, list):
+                failed = [item.get("reason") if isinstance(item, Mapping) else item for item in failed]
             receipt = asyncio.run(core.deletion_service.record_plugin_receipt(
                 self.console.character, deletion_id, payload["plugin_id"], status,
-                cleaned=payload.get("cleaned", []), failed=payload.get("failed", [])))
+                cleaned=cleaned, failed=failed))
             return self.console._deletion_receipt_view(receipt)
         return None
 

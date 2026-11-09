@@ -237,6 +237,10 @@ class LimitedMemoryClientTests(unittest.TestCase):
             self.assertEqual(ambiguous["code"], "ambiguous_target")
             self.assertGreaterEqual(len(ambiguous["candidates"]), 2)
 
+            self.service.core.consumer_refs.record("test", {
+                "plugin_id": "dsh_memory", "session_id": "qq-session", "request_id": "used-fact",
+                "memory_ids": [wanted["id"]],
+            })
             status, deleted = self.call("POST", "/v1/memory/forget", {
                 "target": {"type": wanted["type"], "id": wanted["id"]},
             })

@@ -1024,8 +1024,9 @@ class DeletionStore:
 
     def set_plugin_sources(
         self, character: str, deletion_id: str, source_keys: Sequence[str],
+        *, notify_plugins: bool = True,
     ) -> None:
-        """Add plugin source keys used only for plugin cleanup notifications."""
+        """Fence the source history and optionally register original copies for cleanup."""
         keys = [
             key for key in _bounded_id_list(
                 source_keys, limit=MAX_SOURCE_KEYS, max_chars=600,
@@ -1045,10 +1046,11 @@ class DeletionStore:
                     current.append(key)
                     changed = True
             plugin_ids = list(record.get("plugin_ids") or [])
-            for plugin_id in _plugin_ids_from_keys(current):
-                if plugin_id not in plugin_ids and len(plugin_ids) < MAX_PLUGIN_IDS:
-                    plugin_ids.append(plugin_id)
-                    changed = True
+            if notify_plugins:
+                for plugin_id in _plugin_ids_from_keys(current):
+                    if plugin_id not in plugin_ids and len(plugin_ids) < MAX_PLUGIN_IDS:
+                        plugin_ids.append(plugin_id)
+                        changed = True
             if not changed:
                 return
             record["plugin_source_keys"] = current
@@ -1431,6 +1433,9 @@ class DeletionStore:
         version = int(doc.get("version") or 0)
         out: list[dict[str, Any]] = []
         for record in doc.get("deletions") or ():
+            resolved = (record.get("steps") or {}).get("resolve") or {}
+            if resolved.get("status") not in TERMINAL_STEP_STATUSES:
+                continue
             listed = plugin_text in (record.get("plugin_ids") or [])
             consumer_matched = False
             if not listed and wanted_ids:
@@ -1558,7 +1563,8 @@ def _pending_plugin_item(record: Mapping[str, Any], version: int) -> dict[str, A
         "deletion_id": record.get("deletion_id"),
         "version": int(version or 0),
         "scope": record.get("scope") or "entry",
-        "source_keys": list(record.get("plugin_source_keys") or []),
+        "source_keys": (list(record.get("plugin_source_keys") or [])
+                        if record.get("source_keys") or record.get("scope") == "episode" else []),
         "episode_ids": list(record.get("episode_ids") or [])[:MAX_PENDING_EPISODE_IDS],
         "target_texts": texts,
         "memory_ids": list(dict.fromkeys(str(item["id"]) for item in

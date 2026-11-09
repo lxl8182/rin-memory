@@ -114,9 +114,11 @@ class DeletionService:
 
     # -- public API ------------------------------------------------------
 
-    async def forget(self, request: DeletionRequest) -> DeletionReceipt:
-        """Register the barrier, clean the owned stores and return the receipt."""
-        return await asyncio.to_thread(self._forget_sync, request)
+    async def forget(
+        self, request: DeletionRequest, *, defer_cleanup: bool = False,
+    ) -> DeletionReceipt:
+        """Register the barrier and optionally leave the remaining steps for retry."""
+        return await asyncio.to_thread(self._forget_sync, request, defer_cleanup=defer_cleanup)
 
     async def retry(self, character: str, deletion_id: str, *, force: bool = False) -> DeletionReceipt:
         """Re-run pending/failed cleanup steps of an existing deletion."""
@@ -211,7 +213,7 @@ class DeletionService:
 
     # -- forget flow -----------------------------------------------------
 
-    def _forget_sync(self, request: DeletionRequest) -> DeletionReceipt:
+    def _forget_sync(self, request: DeletionRequest, *, defer_cleanup: bool = False) -> DeletionReceipt:
         character = request.scope.character
         spec = self._spec_from_request(request)
         with self._barrier.write_lock(character):
@@ -247,7 +249,8 @@ class DeletionService:
                 )
             # Barrier is durable: reads stop serving the content from here on.
             self._barrier.refresh(character)
-            self._run_steps(character, prepared.deletion_id)
+            if not defer_cleanup:
+                self._run_steps(character, prepared.deletion_id)
             receipt = self._deletions.get(character, prepared.deletion_id)
             return self._receipt(receipt, request_id=request.request_id)
 
@@ -266,7 +269,7 @@ class DeletionService:
                 not in ("completed", "skipped")
             ]
             plugin_step = (record.get("steps") or {}).get("plugin", {})
-            if (
+            if "resolve" in steps or (
                 record.get("plugin_ids")
                 and plugin_step.get("status") not in ("completed", "skipped")
             ):
@@ -582,9 +585,12 @@ class DeletionService:
             episode_ids=resolved["episode_ids"],
             text_hashes=resolved["text_hashes"],
         )
+        # Remember provenance for the history recall fence. Only explicit
+        # source/episode deletion cleans the original chat copies.
         if fact_source_keys:
             self._deletions.set_plugin_sources(
                 character, deletion_id, fact_source_keys,
+                notify_plugins=bool(requested_keys or episode_wanted),
             )
         if texts:
             self._deletions.add_target_texts(
@@ -663,7 +669,7 @@ class DeletionService:
                 str(item.get("text_hash")) for item in targets
                 if item.get("text_hash")
             ],
-            "fact_source_keys": list(record.get("source_keys") or ()),
+            "fact_source_keys": list(record.get("plugin_source_keys") or record.get("source_keys") or ()),
             "requested_source_keys": list(record.get("source_keys") or ()),
             "explicit_fact_ids": [
                 str(item.get("id")) for item in targets
@@ -939,7 +945,10 @@ class DeletionService:
         plugin_ids = list(record.get("plugin_ids") or ())
         current = (record.get("steps") or {}).get("plugin", {}).get("status")
         if plugin_ids:
-            if current != "completed":
+            receipts = record.get("plugin_receipts") or {}
+            if current != "completed" and not any(
+                (receipts.get(plugin_id) or {}).get("status") == "failed" for plugin_id in plugin_ids
+            ):
                 self._deletions.update_step(
                     character, deletion_id, "plugin", "pending",
                     {"plugin_ids": plugin_ids},

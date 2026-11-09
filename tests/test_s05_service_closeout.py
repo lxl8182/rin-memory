@@ -431,6 +431,57 @@ class ServiceCloseoutTests(unittest.TestCase):
         self.assertFalse(any(row["id"] == "tunnel-fact"
                              for row in self.service.core.facts.load("test")))
 
+    def test_console_deletion_reports_the_barrier_before_cleanup_and_tracks_plugin_receipts(self):
+        core = self.service.core
+        core.facts.save("test", [{"id": "async-fact", "text": "等待接入端的临时事实"}])
+        self.assertTrue(core.consumer_refs.record("test", {
+            "plugin_id": "game_test", "session_id": "chat-session",
+            "request_id": "used-fact", "memory_ids": ["async-fact"],
+        }))
+        release = threading.Event()
+        finished = threading.Event()
+        run_steps = core.deletion_service._run_steps
+
+        def wait_for_cleanup(*args, **kwargs):
+            try:
+                if not release.wait(5):
+                    raise TimeoutError("test did not release cleanup")
+                return run_steps(*args, **kwargs)
+            finally:
+                finished.set()
+
+        with patch.object(core.deletion_service, "_run_steps", side_effect=wait_for_cleanup):
+            try:
+                code, receipt = self.request("/v1/cleanup/delete", {
+                    "type": "fact", "id": "async-fact", "request_id": "async-delete", "defer_cleanup": True,
+                })
+                self.assertEqual(code, 202)
+                self.assertTrue(receipt["stopped_using"])
+                self.assertFalse(receipt["content_cleaned"])
+                deletion_id = receipt["deletion_id"]
+                rows = self.ok("/v1/cleanup?receipts_only=1")
+                self.assertEqual(set(rows), {"deletions"})
+                self.assertFalse(rows["deletions"][0]["content_cleaned"])
+                self.assertFalse(self.ok("/v1/cleanup/pending", client="plugin", token="test-plugin")["items"])
+            finally:
+                release.set()
+            self.assertTrue(finished.wait(5))
+
+        path = "/v1/cleanup/" + deletion_id + "/ack"
+        rows = self.ok("/v1/cleanup?receipts_only=1")["deletions"]
+        self.assertTrue(rows[0]["content_cleaned"])
+        self.assertEqual(rows[0]["status"], "pending")
+        pending = self.ok("/v1/cleanup/pending", client="plugin", token="test-plugin")["items"]
+        self.assertEqual(pending[0]["consumer_sessions"], ["chat-session"])
+        self.assertEqual(pending[0]["source_keys"], [])
+        failed = self.ok(path, {"status": "failed", "failed": [{"reason": "session lock"}]},
+                         client="plugin", token="test-plugin")
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["plugin_receipts"]["game_test"]["failed"], ["session lock"])
+        retried = self.ok("/v1/cleanup/retry", {"deletion_id": deletion_id})
+        self.assertEqual(retried["status"], "failed")
+        self.assertEqual(self.ok(path, {"status": "cleaned"}, client="plugin", token="test-plugin")["status"], "completed")
+
     def test_cross_origin_and_untrusted_host_requests_stay_blocked(self):
         for host, origin in (
             ("127.0.0.1:14931", "http://evil.test"),

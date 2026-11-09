@@ -1285,6 +1285,99 @@
 
   /* ---------- cleanup ---------- */
 
+  let cleanupTimer = null;
+  let cleanupPolling = false;
+  let cleanupPollFailed = false;
+  let cleanupRevision = 0;
+  const watchedDeletions = new Set();
+
+  function deletionStatus(row) {
+    if (row.status === "completed") return "清理完成";
+    if (row.status === "failed") return "清理失败";
+    if (row.content_cleaned) return "等待接入端确认";
+    return row.stopped_using ? "正在清理本地副本" : "正在登记删除";
+  }
+
+  function updateDeletion(receipt) {
+    cleanupRevision++;
+    const cleanup = LIVE.snapshot.cleanup;
+    const target = (receipt.targets || [])[0] || {};
+    const row = Object.assign({}, receipt, {
+      target_type: target.type || "来源",
+      target_id: target.id || (receipt.source_keys || [])[0] || (receipt.episode_ids || [])[0],
+      completed_at: receipt.updated_at,
+      step_errors: Object.fromEntries(Object.entries(receipt.steps || {})
+        .filter(([, step]) => step.detail?.error).map(([name, step]) => [name, step.detail.error])),
+    });
+    cleanup.deletions = [row, ...(cleanup.deletions || []).filter((item) => item.deletion_id !== row.deletion_id)];
+    if (row.stopped_using && target.id) {
+      cleanup.deletable = (cleanup.deletable || []).filter((item) => item.id !== target.id || item.type !== target.type);
+    }
+    if (row.status === "pending") watchedDeletions.add(row.deletion_id);
+    renderCleanup();
+  }
+
+  function watchCleanup() {
+    if (cleanupTimer !== null || cleanupPolling || document.hidden) return;
+    const rows = LIVE.snapshot?.cleanup?.deletions || [];
+    if (!rows.some((row) => row.status === "pending")
+      && !(location.hash === "#cleanup" && rows.some((row) => row.status === "failed"))) return;
+    cleanupTimer = setTimeout(pollCleanup, rows.some((row) => row.status === "pending") ? 1500 : 5000);
+  }
+
+  async function pollCleanup() {
+    cleanupTimer = null;
+    if (!LIVE.connected || document.hidden) return;
+    cleanupPolling = true;
+    const revision = cleanupRevision;
+    try {
+      const result = await api("/api/cleanup?receipts_only=1");
+      if (revision !== cleanupRevision) return;
+      const cleanup = LIVE.snapshot.cleanup;
+      const changed = cleanupPollFailed || JSON.stringify(cleanup.deletions) !== JSON.stringify(result.deletions);
+      cleanupPollFailed = false;
+      cleanup.deletions = result.deletions;
+      const finished = result.deletions.filter((row) => row.status !== "pending" && watchedDeletions.delete(row.deletion_id));
+      if (changed) renderCleanup();
+      if (finished.length === 1) toast("删除已生效 · " + deletionStatus(finished[0]));
+      if (finished.length > 1) toast(finished.length + " 项删除回执已更新");
+      if (finished.length && !watchedDeletions.size) {
+        const latest = await api("/api/cleanup");
+        if (revision === cleanupRevision) {
+          LIVE.snapshot.cleanup = latest;
+          renderCleanup();
+        }
+      }
+    } catch (_) {
+      cleanupPollFailed = true;
+      const hint = $("#cleanHint");
+      if (hint) hint.textContent = "暂时无法获取清理进度，稍后重试";
+    } finally {
+      cleanupPolling = false;
+      watchCleanup();
+    }
+  }
+
+  async function submitDeletion(body) {
+    toast("正在提交删除…");
+    try {
+      const result = await api("/api/cleanup/delete", {
+        method: "POST", body: JSON.stringify({ ...body, ...(SERVICE ? { defer_cleanup: true } : {}) }),
+      });
+      updateDeletion(result);
+      if (result.stopped_using && body.source_key && LIVE.snapshot.timeline?.events) {
+        const timeline = LIVE.snapshot.timeline;
+        timeline.events = timeline.events.filter((event) => event.source_key !== body.source_key);
+        renderTimeline();
+      }
+      toast("删除已生效 · " + deletionStatus(result));
+      return result;
+    } catch (error) {
+      toast("删除请求失败：" + error.message);
+      return null;
+    }
+  }
+
   function renderCleanup() {
     const cleanup = LIVE.snapshot.cleanup || {};
     const deletable = cleanup.deletable || [];
@@ -1299,7 +1392,12 @@
     const tools = $('[data-page="cleanup"] .page-tools');
     if (tools) tools.innerHTML = '<button type="button" class="btn" data-live-tombstones>查看墓碑</button>';
     const cleanHint = $("#cleanHint");
-    if (cleanHint) cleanHint.textContent = deletable.length + " 项可清理 · " + pendingDeletions.length + " 项处理中";
+    if (cleanHint) {
+      const failed = pendingDeletions.filter((row) => row.status === "failed").length;
+      const label = deletable.length + " 项可清理 · " + (pendingDeletions.length - failed) + " 项处理中"
+        + (failed ? " · " + failed + " 项失败" : "");
+      if (cleanHint.textContent !== label) cleanHint.textContent = label;
+    }
 
     // type filter + page slice keep the queue readable as the root grows
     const kinds = Array.from(new Set(deletable.map((item) => item.type)));
@@ -1315,11 +1413,18 @@
         + esc(item.text || item.id) + '<div class="impact">' + esc(item.id) + '</div></div>'
         + '<span class="r">可删除</span><span class="r"><button type="button" class="link danger" data-live-delete="'
         + esc(item.id) + '" data-type="' + esc(item.type) + '">删除</button></span></div>').join("");
-      const runningRows = pendingDeletions.map((row) =>
-        '<div class="clean-row"><span class="k">删除</span><div class="t">' + esc(row.target_type)
-        + " · " + esc(row.target_id) + '<div class="impact">' + esc(row.reason || "处理中") + '</div></div>'
-        + '<span class="r">' + esc(relTime(row.created_at)) + '</span><span class="r">' + esc(row.status)
-        + (SERVICE ? '<button class="link" data-live-cleanup-retry="' + esc(row.deletion_id) + '">重试清理</button>' : '') + "</span></div>").join("");
+      const runningRows = pendingDeletions.map((row) => {
+        const problems = Object.entries(row.plugin_receipts || {}).filter(([, receipt]) => receipt.status === "failed")
+          .map(([plugin, receipt]) => plugin + " · " + ((receipt.failed || []).join("、") || "副本清理失败"));
+        problems.push(...Object.values(row.step_errors || {}));
+        const detail = [row.stopped_using ? "已停止召回" : "", ...problems].filter(Boolean).join(" · ");
+        const retry = SERVICE && (row.status === "failed" || !row.content_cleaned)
+          ? '<button class="link" data-live-cleanup-retry="' + esc(row.deletion_id) + '">重试清理</button>' : "";
+        return '<div class="clean-row"><span class="k">删除</span><div class="t">' + esc(row.target_type)
+          + " · " + esc(row.target_id) + '<div class="impact">' + esc(detail) + '</div></div>'
+          + '<span class="r">' + esc(relTime(row.created_at)) + '</span><span class="r">' + esc(deletionStatus(row))
+          + retry + "</span></div>";
+      }).join("");
       const chips = kinds.length > 1
         ? '<div class="chips clean-chips">' + [["all", "全部 " + deletable.length]]
           .concat(kinds.map((kind) => [kind, (CLEAN_TYPE_LABELS[kind] || kind) + " "
@@ -1354,6 +1459,7 @@
     }
     const footer = $('[data-page="cleanup"] .panel .card-f');
     if (footer) footer.innerHTML = '<span class="dim">删除屏障会阻止同一来源被重新写入</span><a data-nav="settings" href="#settings">清理设置 →</a>';
+    watchCleanup();
   }
 
   /* ---------- settings ---------- */
@@ -2532,9 +2638,9 @@
       "<p>删除后同一来源的事件不会因重放被重新写入；派生的事实与反思会一并失效。</p>"
       + '<p class="meta">记忆编号 · ' + esc(event.id) + "　|　会生成墓碑，仅保留来源指纹</p>",
       "删除", async () => {
-        const result = await write("/api/cleanup/delete", {
+        const result = await submitDeletion({
           source_key: event.source_key, reason: "webui delete", request_id: rid("ui-delete"),
-        }, "已删除 · 已生成墓碑");
+        });
         if (result) {
           const drawer = $("#drawer");
           if (drawer) drawer.classList.remove("on");
@@ -2723,7 +2829,18 @@
     const retryCleanup = target.closest("[data-live-cleanup-retry]");
     if (retryCleanup) {
       event.preventDefault();
-      await write("/v1/cleanup/retry", { deletion_id: retryCleanup.dataset.liveCleanupRetry }, "清理已重试");
+      retryCleanup.disabled = true;
+      toast("正在重试清理…");
+      try {
+        const result = await api("/v1/cleanup/retry", { method: "POST",
+          body: JSON.stringify({ deletion_id: retryCleanup.dataset.liveCleanupRetry }) });
+        updateDeletion(result);
+        toast(deletionStatus(result));
+      } catch (error) {
+        toast("重试清理失败：" + error.message);
+      } finally {
+        retryCleanup.disabled = false;
+      }
       return;
     }
     const retractCorrection = target.closest("[data-live-correction-retract]");
@@ -2739,9 +2856,9 @@
       openLiveModal("删除这条记忆？",
         "<p>删除会生成墓碑，并使派生的事实与反思失效。</p>"
         + '<p class="meta">' + esc(type) + " · " + esc(id) + "</p>", "删除", async () => {
-          await write("/api/cleanup/delete", {
+          await submitDeletion({
             type, id, reason: "webui delete", request_id: rid("ui-delete"),
-          }, "已删除");
+          });
         });
       return;
     }
@@ -2864,6 +2981,8 @@
 
   bindChat();
   bindModelConfig();
+  document.addEventListener("visibilitychange", watchCleanup);
+  window.addEventListener("hashchange", watchCleanup);
   if (SERVICE) {
     $("#qqPersonaForm")?.addEventListener("submit", (event) => {
       event.preventDefault();
