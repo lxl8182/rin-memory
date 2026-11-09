@@ -738,7 +738,7 @@ class ExtractionService:
         prompt = identity + _build_batch_prompt(utterances, reference)
         prompt += _old_fact_material(old_facts)
         prompt += self._applied_correction_material(character, all_keys, metadata)
-        if self._conversation_state is not None and not is_friend_subject(metadata.get("subject")):
+        if self._conversation_state is not None:
             state = self._conversation_state.snapshot(character, metadata)
             prompt += (
                 "\n\n我同时整理正在关注的事项，以第一人称写 text、next_step 和 why。输出采用 JSON 对象："
@@ -752,7 +752,7 @@ class ExtractionService:
                 "操作字段为 op/id/ref/text/next_step/why/sources。"
                 "sources 是本操作依据的原话编号。next_step 写适合后续交流的具体下一步。"
                 "明确完成或取消时使用 close_*；暂停话题保留其当前进度。"
-                "对方明确约定提醒或回访时设置 agreed_followup=true，其他事项使用 false。"
+                + _state_followup_rule(metadata) +
                 "followup_when 在原话提供跟进时间时填写，格式与 event_when.start "
                 "一致（offset/unit），以该操作引用的原话时间为基准；其余情况留空。"
                 "\n本批原话时间：" + json.dumps(
@@ -803,8 +803,7 @@ class ExtractionService:
             self._settle_op(character, op_ids, outcome)
             return outcome
         raw_candidates, raw_updates, raw_signals = parsed
-        if is_friend_subject(metadata.get("subject")):
-            raw_updates, raw_signals = [], []
+        raw_updates = _scoped_state_updates(raw_updates, metadata)
         # An answer without attributable sources is a failed extraction, not
         # an empty result. Keep the entire batch queued before writing any
         # facts or state so a later retry can repair the model's citations.
@@ -835,7 +834,7 @@ class ExtractionService:
             self._settle_op(character, op_ids, outcome)
             return outcome
         state_applied = 0
-        if self._conversation_state is not None and raw_updates and not is_friend_subject(metadata.get("subject")):
+        if self._conversation_state is not None and raw_updates:
             entries = _bind_state_updates(raw_updates, utterances)
             if entries:
                 state_applied = self._conversation_state.apply_sequence(
@@ -965,19 +964,19 @@ class ExtractionService:
             old_facts = self._related_facts(character, kept, metadata, reference=context)
             prompt = identity + _build_prompt(kept, context) + _old_fact_material(old_facts)
             prompt += self._applied_correction_material(character, evidence_keys, metadata)
-            if self._conversation_state is not None and not is_friend_subject(metadata.get("subject")):
+            if self._conversation_state is not None:
                 state = self._conversation_state.snapshot(character, metadata)
                 prompt += (
                     "\n\n我同时整理正在关注的事项，以第一人称写 text、next_step 和 why。输出采用 JSON 对象："
                     '{"facts":[上述事实],"state_updates":[事项操作]}。'
                     "事实或事项为空时分别使用空数组。我从明确计划、正在处理的事、"
                     "后续进展和完成/取消记录中整理事项。只在用户明确承诺、接受、正在做或实际要求跟进时建事项。"
-                "开放讨论、建议、问能力、当前一次性的请求与尚未接受的提议留在对话里。"
+                    "开放讨论、建议、问能力、当前一次性的请求与尚未接受的提议留在对话里。"
                     "操作采用 set_progress/set_concern/close_progress/close_concern；"
                     "更新或结束已有事项引用下面的 id，新建时 id 留空。"
                     "操作字段为 op/id/text/next_step/why。next_step 写适合后续交流的具体下一步。"
                     "明确完成或取消时使用 close_*；暂停话题保留其当前进度。"
-                    "对方明确约定提醒或回访时设置 agreed_followup=true，其他事项使用 false。"
+                    + _state_followup_rule(metadata) +
                     "followup_when 在原话提供跟进时间时填写，格式与 event_when.start "
                     "一致（offset/unit），以本轮原始时间为基准；其余情况留空。"
                     "\n本轮原始时间：" + (occurred_at or self._clock.now()).isoformat()
@@ -1024,10 +1023,10 @@ class ExtractionService:
         if error:
             status = self._barrier_outcome_status(character, evidence_keys) if error == "barrier_stale" else "failed"
             return ExtractionOutcome(status, reason=error)
-        if self._conversation_state is not None and not is_friend_subject(metadata.get("subject")):
+        if self._conversation_state is not None:
             try:
                 self._conversation_state.apply(
-                    character, state_updates, metadata=metadata,
+                    character, _scoped_state_updates(state_updates, metadata), metadata=metadata,
                     source_keys=evidence_keys, occurred_at=occurred_at,
                 )
             except ValueError as exc:
@@ -1052,7 +1051,7 @@ class ExtractionService:
 
     def _identity_prompt(self, character: str, metadata: Mapping[str, Any]) -> str:
         if is_friend_subject(metadata.get("subject")):
-            return "这次对话的对象是 QQ 朋友。我只整理这位朋友和本次互动的事实，按原话记录称呼与关系。\n\n"
+            return "这次对话的对象是 QQ 朋友。我整理这位朋友和本次互动的事实，按原话记录称呼与关系。\n\n"
         snapshot = self._persona_reader(character) if self._persona_reader else None
         if snapshot is None or not snapshot.available:
             return ""
@@ -1684,6 +1683,21 @@ def _bind_candidate(
     # statement is the one that was actually said with that meaning.
     row["_anchor"] = anchor
     return row
+
+
+def _state_followup_rule(metadata: Mapping[str, Any]) -> str:
+    if is_friend_subject(metadata.get("subject")):
+        return ("新事项仅收录这位朋友明确愿意以后继续的话题或双方约好的跟进，"
+                "标记 agreed_followup=true，记录具体接续点。")
+    return "对方明确约定提醒或回访时设置 agreed_followup=true，其他事项使用 false。"
+
+
+def _scoped_state_updates(
+    updates: list[dict[str, Any]], metadata: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    if not is_friend_subject(metadata.get("subject")):
+        return updates
+    return [row for row in updates if row.get("id") or row.get("ref") or row.get("agreed_followup") is True]
 
 
 def _bind_state_updates(

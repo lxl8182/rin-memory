@@ -2110,9 +2110,9 @@ class RecallService:
                     selected = self._fast_selection(current, candidates, token_budget, historical=historical,
                                                     recent=recent, anchor=anchor)
                     status = "selected" if selected else "empty"
-                    continued = self._explicit_segment_matches(current, previous)
+                    continued = self._explicit_segment_matches(current, previous, segment_history)
                 if status in ("timed_out", "unavailable", "invalid_output"):
-                    continued = self._explicit_segment_matches(current, previous)
+                    continued = self._explicit_segment_matches(current, previous, segment_history)
                     if self._settings.fast_chat or (recent and has_anaphora(current)):
                         selected = self._fast_selection(current, candidates, token_budget, historical=historical,
                                                         recent=recent, anchor=anchor)
@@ -2398,7 +2398,7 @@ class RecallService:
                 related.append(row["source_key"])
         return related
 
-    def _explicit_segment_matches(self, current, previous):
+    def _explicit_segment_matches(self, current, previous, history):
         if not previous or not (has_anaphora(current) or _HISTORY_QUERY.search(current)
                                 or _RELATIVE_HISTORY.search(current) or _DETAIL_QUERY.search(current)):
             return []
@@ -2407,8 +2407,11 @@ class RecallService:
         query = content_terms(topic, self._stop_names)
         if not query:
             return []
-        overlaps = [(row["key"], query & content_terms(row["user"] + " " + row["assistant"], self._stop_names))
-                    for row in previous]
+        overlaps = []
+        for row in previous:
+            original = history[int(row["key"])]
+            terms = content_terms(original["user"] + " " + original["assistant"], self._stop_names)
+            overlaps.append((row["key"], query & terms))
         exact = [key for key, terms in overlaps if terms == query]
         if len(exact) == 1 and (len(query) >= 2 or current.rstrip(" ？?!！。").endswith(("呢", "了吗"))):
             return exact

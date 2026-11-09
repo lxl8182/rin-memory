@@ -201,6 +201,9 @@ class ServiceCloseoutTests(unittest.TestCase):
             key = f"plugin:game_test:test:private:old:exchange-{i}"
             user = f"海边露营装备清单第{i}项" if i < 14 else f"番茄炒蛋第{i}步"
             reply = f"海边露营装备清单已记第{i}项。" if i < 14 else "先切番茄。"
+            if i == 15:
+                user = "讲一下 Go 运行时"
+                reply = "这里是前文。" * 100 + "最后聊到 GMP 调度。"
             receipt = self.ok("/v1/context", old, **plugin)["context_receipt_id"]
             self.ok("/v1/turns", self.body(f"exchange-{i}", **old,
                 source_key=key, context_receipt_id=receipt,
@@ -243,6 +246,7 @@ class ServiceCloseoutTests(unittest.TestCase):
         self.service.core.recall._model.invoke = timeout
         self.assertEqual(replay("昨天露营装备清单具体有哪些？")["context"]["segment_sources"],
                          [row["source_key"] for row in rows[:14]])
+        self.assertEqual(replay("GMP 调度呢？")["context"]["segment_sources"], [rows[15]["source_key"]])
         self.assertFalse(replay("上次那个呢？")["context"].get("segment_sources"))
 
         all_sources = [row["source_key"] for row in rows]
@@ -341,7 +345,7 @@ class ServiceCloseoutTests(unittest.TestCase):
         facts = core.facts.load("test")
         self.assertEqual(len(facts), 1)
         self.assertEqual(facts[0]["subject"], "qq-friend:42")
-        self.assertNotIn("state_updates", calls[0])
+        self.assertIn("新事项仅收录这位朋友明确愿意以后继续的话题", calls[0])
         self.assertNotIn("兴趣信号", calls[0])
         fact_id = facts[0]["id"]
 

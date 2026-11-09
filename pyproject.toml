@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rin-memory"
-version = "0.1.0.dev17"
+version = "0.1.0.dev18"
 description = "RIN: Recall, Identity, Nurture. Editable personas, continuous growth and long-term companion memory."
 readme = "README.md"
 requires-python = ">=3.11"
