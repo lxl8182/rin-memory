@@ -1717,27 +1717,13 @@
       </div>
 
       <aside class="panel">
-        <header class="card-h"><h2 data-en="DONE">已完成</h2><span class="hint">8 项 · 最近 7 天</span></header>
+        <header class="card-h"><h2 data-en="DONE">已完成</h2><span class="hint" id="cleanDoneHint">—</span></header>
         <div class="card-b" style="padding:0">
           <div class="clean-group" style="padding-top:14px">
-            <div class="clean-row dim" style="grid-template-columns:50px minmax(0,1fr) 86px">
-              <span class="k">删除</span><div class="t">事实 · fact_0121「常熬夜」</div><span class="r">10.20</span>
-            </div>
-            <div class="clean-row dim" style="grid-template-columns:50px minmax(0,1fr) 86px">
-              <span class="k">重试</span><div class="t">抽取任务 · outbox #331</div><span class="r">10.17</span>
-            </div>
-            <div class="clean-row dim" style="grid-template-columns:50px minmax(0,1fr) 86px">
-              <span class="k">删除</span><div class="t">对话 · 「最近总熬夜」相关 3 条</div><span class="r">10.18</span>
-            </div>
-            <div class="clean-row dim" style="grid-template-columns:50px minmax(0,1fr) 86px">
-              <span class="k">更正</span><div class="t">事实 · fact_0121「常熬夜」</div><span class="r">10.18</span>
-            </div>
-            <div class="clean-row dim" style="grid-template-columns:50px minmax(0,1fr) 86px">
-              <span class="k">删除</span><div class="t">对话 · 「旧作息」相关 2 条</div><span class="r">10.16</span>
-            </div>
+            <div class="empty">暂无更正记录</div>
           </div>
         </div>
-        <footer class="card-f"><span class="dim">墓碑只保留来源指纹，不保留内容</span><button type="button" class="link" data-toast="已展开全部清理记录">查看全部 →</button></footer>
+        <footer class="card-f"><span class="dim">删除屏障保留来源指纹</span></footer>
       </aside>
     </div>
   </section>
@@ -2649,7 +2635,7 @@
   else init();
 })();
 </script>
-<script src="live.js?v=0.1.0.dev20"></script>
+<script src="live.js?v=0.1.0.dev21"></script>
 <script src="motion.js"></script>
 </body>
 </html>

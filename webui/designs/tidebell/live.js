@@ -1447,19 +1447,17 @@
         + '</span></h3>' + (pendingRows + runningRows || '<div class="empty">没有待处理的清理项</div>')
         + "</div>" + more;
     }
+    const doneHint = $("#cleanDoneHint");
+    if (doneHint) doneHint.textContent = deletions.filter((row) => row.status === "completed").length + " 项删除已完成";
     const right = $('[data-page="cleanup"] .panel:nth-child(2) .card-b');
     if (right) {
-      const doneDeletions = deletions.filter((row) => row.status === "completed").map((row) =>
-        '<div class="clean-row dim" style="grid-template-columns:50px minmax(0,1fr) 86px"><span class="k">删除</span>'
-        + '<div class="t">' + esc(row.target_type) + " · " + esc(row.target_id) + '</div><span class="r">'
-        + esc(relTime(row.completed_at || row.created_at)) + "</span></div>").join("");
       const doneCorrections = corrections.map((row) =>
         '<div class="clean-row dim" style="grid-template-columns:50px minmax(0,1fr) 86px"><span class="k">更正</span>'
         + '<div class="t">' + esc(row.old_text) + " → " + esc(row.new_text) + '</div><span class="r">'
         + esc(row.store_status === "retracted" ? "已撤回" : relTime(row.created_at))
         + (SERVICE && row.store_status === "active" ? '<button class="link" data-live-correction-retract="' + esc(row.id) + '">撤回更正</button>' : '') + "</span></div>").join("");
       right.innerHTML = '<div class="clean-group" style="padding-top:14px">'
-        + (doneDeletions + doneCorrections || '<div class="empty">暂无已完成记录</div>') + "</div>";
+        + (doneCorrections || '<div class="empty">暂无更正记录</div>') + "</div>";
     }
     const footer = $('[data-page="cleanup"] .panel .card-f');
     if (footer) footer.innerHTML = '<span class="dim">删除屏障会阻止同一来源被重新写入</span><a data-nav="settings" href="#settings">清理设置 →</a>';
