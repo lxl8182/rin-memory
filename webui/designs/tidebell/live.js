@@ -1313,7 +1313,8 @@
     if (row.stopped_using && target.id) {
       cleanup.deletable = (cleanup.deletable || []).filter((item) => item.id !== target.id || item.type !== target.type);
     }
-    if (row.status === "pending") watchedDeletions.add(row.deletion_id);
+    if (row.status !== "completed") watchedDeletions.add(row.deletion_id);
+    else watchedDeletions.delete(row.deletion_id);
     renderCleanup();
   }
 
@@ -1334,10 +1335,13 @@
       const result = await api("/api/cleanup?receipts_only=1");
       if (revision !== cleanupRevision) return;
       const cleanup = LIVE.snapshot.cleanup;
+      const previous = new Map(cleanup.deletions.map((row) => [row.deletion_id, row.status]));
       const changed = cleanupPollFailed || JSON.stringify(cleanup.deletions) !== JSON.stringify(result.deletions);
       cleanupPollFailed = false;
       cleanup.deletions = result.deletions;
-      const finished = result.deletions.filter((row) => row.status !== "pending" && watchedDeletions.delete(row.deletion_id));
+      const finished = result.deletions.filter((row) => watchedDeletions.has(row.deletion_id)
+        && row.status !== "pending" && previous.get(row.deletion_id) !== row.status);
+      for (const row of finished) if (row.status === "completed") watchedDeletions.delete(row.deletion_id);
       if (changed) renderCleanup();
       if (finished.length === 1) toast("删除已生效 · " + deletionStatus(finished[0]));
       if (finished.length > 1) toast(finished.length + " 项删除回执已更新");
