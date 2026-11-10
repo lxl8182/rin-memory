@@ -821,6 +821,29 @@ class EvolutionEligibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model.calls, [])
         self.assertEqual(core.persona_card_service.get("demo").revision, 1)
 
+    async def test_mature_evidence_survives_the_budget_in_both_entry_points(self):
+        model = ScriptedModel({
+            "operations": [{"op": "replace", "section_id": "tone", "text": "我说话温柔，也会给具体例子。"}],
+            "reason": "新的具体做法",
+        })
+        core = self.build(model)
+        self.prepare(core)
+        facts = core.facts.load("demo")
+        noise = [fact(f"unrelated_{index}", "一条背景事实") for index in range(12)]
+        core.facts.save("demo", noise + facts)
+
+        direct = await core.evolution_service.propose("demo", {"base_revision": 1})
+        self.assertEqual(direct.status, "proposed")
+        direct_evidence = json.loads(model.calls[0]["messages"][1]["content"])["evidence"]
+        self.assertEqual([row["source_ref"] for row in direct_evidence[:2]], ["ref_understanding", "fact_a"])
+
+        core.persona_admin_service.set_mode("demo", "propose")
+        scheduled = await core.evolution_scheduler.evaluate("demo")
+        self.assertEqual(scheduled.status, "proposed")
+        self.assertEqual(scheduled.run["evidence"]["ids"][:2], ["ref_understanding", "fact_a"])
+        evidence = json.loads(model.calls[1]["messages"][1]["content"])["evidence"]
+        self.assertEqual([row["source_ref"] for row in evidence[:2]], ["ref_understanding", "fact_a"])
+
 
 class EvidenceDtoTests(unittest.TestCase):
     """The DTO is the contract all three layers read."""

@@ -230,6 +230,26 @@ def _is_fact(row: Mapping[str, Any]) -> bool:
     )
 
 
+def prioritize_evidence(rows: Sequence[dict[str, Any]], requested: Sequence[str] = ()) -> list[dict[str, Any]]:
+    """Put eligible understandings and their sources ahead of general context."""
+    def is_eligible(row: Mapping[str, Any]) -> bool:
+        dto = row.get("evidence")
+        return not _is_fact(row) and isinstance(dto, Mapping) and dto.get("eligible") is True
+
+    requested_ids = set(requested)
+    supporting = {ref for row in rows if is_eligible(row) for ref in row.get("source_fact_ids") or ()}
+
+    def order(row: Mapping[str, Any]) -> tuple[int, bool]:
+        ref = _row_ref(row)
+        if is_eligible(row):
+            return 0, ref not in requested_ids
+        if ref in supporting:
+            return 1, ref not in requested_ids
+        return (3 if _is_fact(row) else 2), ref not in requested_ids
+
+    return sorted(rows, key=order)
+
+
 def _row_text(row: Mapping[str, Any]) -> str:
     for key in ("text", "claim", "summary", "statement"):
         value = row.get(key)
@@ -521,7 +541,7 @@ class EvolutionService:
             raw = []
         rows = [copy.deepcopy(dict(row)) for row in raw if isinstance(row, Mapping)
                 and not is_friend_subject(_row_subject(row))]
-        rows = rows[: self._settings.max_evidence]
+        rows = prioritize_evidence(rows, req.source_refs)[: self._settings.max_evidence]
         if not rows:
             return [], REASON_INSUFFICIENT_EVIDENCE, _validation(
                 [_check("evidence", False, REASON_INSUFFICIENT_EVIDENCE)],
@@ -751,16 +771,18 @@ class EvolutionService:
         }
         system = (
             FIRST_PERSON_VOICE
-            + "我结合当前人格和已经形成的成长，整理此刻完整、连贯的自我描述。"
-            "我把新的理解融入相关段落，用第一人称表达自己的性格、兴趣、判断和相处方式。"
-            "我优先用 replace 重写相关段落，使相近内容自然融合，当前表达准确体现现在的我。"
-            "独立的新方面使用 add，已由其他段落涵盖的重复内容使用 delete。"
-            "我把相近内容合并表达，将过时的理解留在历史中；常规修订优先在现有篇幅内整理，"
-            "新增的独立认识按实际信息需要增加篇幅。\n"
+            + "我先判断合格证据是否确立了一项具体、可延续的变化，以及它适用于什么情境。"
+            "一段往事、对方为我付出的劳动、随口的感谢和我自己的表态都只提供背景，"
+            "不由此推断我的性格、关系深浅、义务或承诺。"
+            "对方的喜好写作我对他的认识，我自己的偏好和做法以可见的行为或反馈为依据。\n"
+            "证据支持实际变化时，我优先用 replace 修改现有段落的相关句子，保留无关的内容。"
+            "没有合适的现有段落时才用 add，已经被其他段落覆盖的重复内容才用 delete。"
+            "我保持原来的语气和证据支持的范围，写出具体做法，不扩写成口号或普遍性格。\n"
             "replace/delete 的目标从 open_section_ids 选择，add 使用新的 section_id。"
             "每段 text 保持在 max_section_chars 范围内。eligible=true 的材料支持本次修订，"
             "eligible=false 的材料用于理解背景与措辞。reason 用第一人称说明实际变化的缘由。"
-            "当前人格已经准确表达这些认识时，返回 {\"operations\":[],\"reason\":\"no_change\"}。\n"
+            "合格证据只记述旧事、没有支持具体变化，或当前人格已有对应内容时，"
+            "返回 {\"operations\":[],\"reason\":\"no_change\"}。\n"
             "本次输出为 JSON 对象：{\"operations\":[{\"op\":\"add|replace|delete\","
             "\"section_id\":\"...\",\"text\":\"...\"}],\"reason\":\"...\"}。"
         )

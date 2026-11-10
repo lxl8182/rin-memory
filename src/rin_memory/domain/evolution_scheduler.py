@@ -44,7 +44,7 @@ from ..persistence.evolution_runs import (
     EvolutionRunStore,
 )
 from ..persistence.persona_admin import AUTO_MODES
-from .evolution import EvolutionService, ProposalRequest
+from .evolution import EvolutionService, ProposalRequest, prioritize_evidence
 from .persona_admin import PersonaAdminService
 from .persona_card import CardSection, PersonaCardService
 
@@ -636,6 +636,10 @@ class EvolutionScheduler:
                 continue
             if row.get("absorbed_into") or row.get("absorbed_at"):
                 continue
+            if _row_ref(row):
+                rows.append(row)
+        rows = prioritize_evidence(rows)[: int(self._settings.max_evidence)]
+        for row in rows:
             status = str(row.get("status") or "").strip().lower()
             if (row.get("deleted") or row.get("invalidated_at")
                     or row.get("corrected")
@@ -643,11 +647,6 @@ class EvolutionScheduler:
                 return [], REASON_SOURCE_DELETED
             if self._row_blocked(name, row):
                 return [], REASON_SOURCE_DELETED
-            if not _row_ref(row):
-                continue
-            rows.append(row)
-            if len(rows) >= int(self._settings.max_evidence):
-                break
         if not rows:
             return [], REASON_NO_EVIDENCE
         return rows, None
