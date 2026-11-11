@@ -1601,6 +1601,20 @@ _RECALL_QUESTION = re.compile(r"[?？]|什么|哪|多久|多少|记得|回忆|�
 _PERSONAL_LIST_QUERY = re.compile(r"(?:我|我们).{0,18}(?:哪些|哪几|有什么)|(?:哪些|哪几).{0,18}(?:是我|我(?:有|用|买|玩|说))")
 _LIST_FACT = re.compile(r"[、]|[二两三四五六七八九十\d]+(?:件|项|款|种)")
 _LOCATION_ACTION = re.compile(r"([\u4e00-\u9fff]在)(?:哪里|哪儿|哪裡|什么地方)[吗呢呀？?。\s]*$")
+_GENERIC_EXPLANATION = re.compile(r"(?:为什么|什么原理|原理是什么|是怎么.{1,24}的)[^。！？]*[？?。]?$|\b(?:why|how does)\b", re.I)
+_PERSONAL_REFERENCE = re.compile(r"我|咱|你(?:还)?记得|之前|刚才|上次|这把|那把|这款|那款|\b(?:i|my|we|our)\b", re.I)
+_CURRENT_STATE = re.compile(r"现在|如今|目前|还在|当前|\b(?:now|currently|still)\b", re.I)
+_ASK_PRICE = re.compile(r"多少钱|多少元|什么价格|什么价位|(?:实付|花了|花费|付了)多少|how much.{0,20}(?:cost|pay|paid)", re.I)
+_CURRENT_PRICE = re.compile(r"(?:现在|目前|当前|今天|市面上)\s*(?:卖|要)?\s*(?:多少钱|多少元|什么价|价格多少)")
+_ASK_PAID_PRICE = re.compile(r"实付|花了|花费|付了|买了|买的|\b(?:pay|paid|spent)\b", re.I)
+_PRICE_AMOUNT = re.compile(r"[¥￥$€]\s*\d|\d+(?:[.,]\d+)?\s*(?:元|块钱|块|rmb|cny|usd)|(?:实付|花了|成交价)\s*[：:]?\s*\d", re.I)
+_PAID_AMOUNT = re.compile(
+    r"^(?=.*(?:实付|买了|已买|买下|买的|入手了|花了|付了|成交|\b(?:paid|bought|spent)\b)).*?(?:"
+    + _PRICE_AMOUNT.pattern + r")", re.I | re.S,
+)
+_ASK_DETAIL_NOUN = re.compile(r"(?:什么|哪种|哪类)([\u4e00-\u9fff])(?:[吗呢])?(?=[\s、，。？！?!,]|$)")
+_ASK_IDENTITY = re.compile(r"哪(?:款|把|台|部|辆|件|本)|什么型号")
+_MODEL_CODE = re.compile(r"(?<![a-z0-9])(?=[a-z0-9-]*\d)[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?![a-z0-9])", re.I)
 _RECALL_FILLER_TERMS = frozenset({"我记", "记得", "我记得", "还记", "还记得"})
 _DATED_RECALL = re.compile(r"发生了|记得|回忆|(?:我|你).{0,12}(?:聊|说|做了|干了|去了|见了)|what (?:happened|did (?:we|i|you))", re.I)
 _BARE_FOLLOWUP = re.compile(r"(?:上次(?:说的)?|那个|那件事|后来|怎么样了|结果(?:如何|呢)|后续|呢|[？?。！!\s])+")
@@ -1686,6 +1700,16 @@ def _selection_key(row):
     elif tier == "growth":
         tier = "reflection"
     return f"{tier}:{row['id']}"
+
+
+def _answer_fields(text):
+    fields = []
+    if _ASK_PRICE.search(text):
+        fields.append(_PAID_AMOUNT if _ASK_PAID_PRICE.search(text) else _PRICE_AMOUNT)
+    detail = _ASK_DETAIL_NOUN.search(text)
+    if detail and detail[1] not in "啊呀呢吗事":
+        fields.append(re.compile(re.escape(detail[1])))
+    return fields
 
 
 def _parse_selection(raw, candidates, *, previous=()):
@@ -2082,7 +2106,11 @@ class RecallService:
                 anchor = followup["thread"]
         context_limit = self._context_limit(max_context_tokens)
         token_budget = min(_SELECTION_TOKENS, context_limit) if context_limit is not None else _SELECTION_TOKENS
-        if query and token_budget:
+        generic = _CURRENT_PRICE.search(current) or (
+            _GENERIC_EXPLANATION.search(current)
+            and not (_PERSONAL_REFERENCE.search(current) or has_anaphora(current))
+        )
+        if query and token_budget and not generic:
             window = _selection_window(current, self._clock.now())
             asks_original = bool(_ORIGINAL_REQUEST.search(current))
             historical = asks_original or bool(
@@ -2222,6 +2250,7 @@ class RecallService:
         rows = list(unique.values())
         topics = [pattern for intent, pattern in _SEMANTIC_TOPICS if intent.search(current)]
         personal_list = _PERSONAL_LIST_QUERY.search(current)
+        answer_fields = _answer_fields(current)
         scored = bm25_scores(query, rows, stop_names=stop_names, k1=settings.bm25_k1, b=settings.bm25_b)
         query_vector = await self._query_vector(query, deadline, self._tokens)
         cosine = _cosine_rank(query_vector, self._embedding_rows(pool)) if query_vector is not None else []
@@ -2237,6 +2266,9 @@ class RecallService:
         vector = {row["id"]: score for row, score in cosine if score >= settings.semantic_threshold}
         now = self._clock.now()
         window = _selection_window(current, now)
+        dated_lookup = (window and _SELECTION_DATE.search(current) and _RECALL_QUESTION.search(current)
+                        and (_PERSONAL_REFERENCE.search(current) or _DATED_RECALL.search(current))
+                        and not _CURRENT_STATE.search(current))
         history = bool(window or _HISTORY_QUERY.search(current) or _normalize_purpose(purpose) in QUERY_PURPOSES)
         recent_query = " ".join(_turn_texts(recent))
         continuation = bool(recent_query and has_anaphora(current))
@@ -2246,6 +2278,8 @@ class RecallService:
         for key, row in unique.items():
             lexical_score, shared = lexical.get(key, (0.0, set()))
             date_hit = bool(window and _overlaps_window(row, window))
+            if dated_lookup and not date_hit and _selection_window(row["text"], now) != window:
+                continue
             thread_hit = row["_tier"] == "thread" and continuation and bool(
                 content_terms(row["text"], stop_names) & content_terms(recent_query, stop_names)
             )
@@ -2263,6 +2297,8 @@ class RecallService:
             match |= bool(personal_list and row["_tier"] in ("fact", "fact_archive")
                           and row.get("source") == "user_observation"
                           and shared - _RECALL_FILLER_TERMS and _LIST_FACT.search(row["text"]))
+            match |= bool(shared - _RECALL_FILLER_TERMS and row["_tier"] in ("fact", "fact_archive")
+                          and any(pattern.search(row["text"]) for pattern in answer_fields))
             score = (lexical_score if match else 0.0) + vector.get(row["id"], 0.0)
             factor = fading_factor(row, now=now)
             if not (history or thread_hit) and factor < _surface_threshold("turn_context"):
@@ -2342,7 +2378,42 @@ class RecallService:
         if not chosen and enumerated:
             latest = max(enumerated, key=lambda item: item.get("occurred_at") or "")
             chosen = [dict(latest, use="回忆此前列出的选择")]
+        chosen = self._focus_fact_answers(current, candidates, chosen)
         return self._fit_selection(chosen, token_budget)
+
+    @staticmethod
+    def _focus_fact_answers(current, candidates, chosen):
+        """Use only grounded answers to the price and concrete attribute asked for."""
+        fields = _answer_fields(current)
+        if not fields:
+            return chosen
+
+        def codes(text):
+            return set(_MODEL_CODE.findall(normalize_text(text)))
+
+        targets = codes(current) or {code for item in chosen if item["kind"] in ("fact", "original")
+                                     for code in codes(item["text"])}
+        if len(targets) > 1:
+            return chosen
+        if targets:
+            eligible = [item for item in candidates if item["kind"] in ("fact", "original") and not item.get("related_to")
+                        and targets <= codes(item["text"])]
+        else:
+            eligible = chosen
+        picked = []
+        if _ASK_IDENTITY.search(current):
+            keys = {item["key"] for item in eligible}
+            identity = next((item for item in chosen if item["key"] in keys
+                             and not any(pattern.search(item["text"]) for pattern in fields)), None)
+            if identity:
+                picked.append(identity)
+        for pattern in fields:
+            match = next((item for item in eligible if pattern.search(item["text"])), None)
+            if match and all(item["key"] != match["key"] for item in picked):
+                picked.append(dict(match, use="回答本轮所问细节"))
+        if not picked and not targets and not _ASK_PRICE.search(current):
+            return chosen
+        return picked
 
     def _original_rows(self, character, subjects, scene, query, window, *, limit):
         if self._timeindex_factory is None:
