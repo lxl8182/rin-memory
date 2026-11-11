@@ -18,6 +18,7 @@ from pathlib import Path
 
 from rin_memory.adapters.composition import build_memory_core
 from rin_memory.contracts import DeletionRequest, DeletionTarget, Scene, Scope
+from rin_memory.domain.recall import RecallSettings
 from rin_memory.persistence.facts_view import FactsView
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
@@ -98,6 +99,28 @@ class RecallSampleContractTests(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
+
+    async def test_fast_recall_of_a_personal_list_prefers_the_latest_confirmed_list(self):
+        core = build_memory_core(memory_root=self.root, clock=FixedClock(),
+                                 recall_settings=RecallSettings(fast_chat=True))
+        core.recover("demo")
+        core.facts.save("demo", [
+            {"id": key, "text": text, "subject": "qq-friend:42", "source": "user_observation",
+             "importance": 6, "created_at": f"2026-10-05T{hour}:00:00+00:00", "schema_version": 2}
+            for key, text, hour in (
+                ("older", "我记得对方会用普洱、白牡丹招待客人。", "09"),
+                ("newer", "我记得对方说普洱、白牡丹和碧螺春都适合招待客人。", "10"),
+                ("placement", "我记得对方把招待客人的茶叶放在橱柜上层。", "11"),
+            )
+        ])
+        for question, expected in (
+            ("我平时用哪些茶叶招待？", ["newer"]),
+            ("你记得我之前把招待客人的茶叶放在哪里吗？", ["placement"]),
+            ("我用哪些材料做相框？", []),
+        ):
+            with self.subTest(question=question):
+                result = await core.recall.build_turn_context("demo", current_input=question, subject="qq-friend:42")
+                self.assertEqual(result["memory_ids"], expected)
 
     def test_corpus_is_well_formed(self):
         cases = build_cases()

@@ -1598,6 +1598,10 @@ _HISTORY_QUERY = re.compile(r"还记得|回忆|以前|曾经|当初|那次|上�
 _DETAIL_QUERY = re.compile(r"细节|原话|具体|怎么说|说了什么|details?|exactly|what .* say", re.I)
 _ORIGINAL_REQUEST = re.compile(r"原话|怎么说的|说过什么|说了什么|聊过什么|聊了什么|exact words|what did .* say", re.I)
 _RECALL_QUESTION = re.compile(r"[?？]|什么|哪|多久|多少|记得|回忆|查一下|\b(?:what|when|which|remember)\b", re.I)
+_PERSONAL_LIST_QUERY = re.compile(r"(?:我|我们).{0,18}(?:哪些|哪几|有什么)|(?:哪些|哪几).{0,18}(?:是我|我(?:有|用|买|玩|说))")
+_LIST_FACT = re.compile(r"[、]|[二两三四五六七八九十\d]+(?:件|项|款|种)")
+_LOCATION_ACTION = re.compile(r"([\u4e00-\u9fff]在)(?:哪里|哪儿|哪裡|什么地方)[吗呢呀？?。\s]*$")
+_RECALL_FILLER_TERMS = frozenset({"我记", "记得", "我记得", "还记", "还记得"})
 _DATED_RECALL = re.compile(r"发生了|记得|回忆|(?:我|你).{0,12}(?:聊|说|做了|干了|去了|见了)|what (?:happened|did (?:we|i|you))", re.I)
 _BARE_FOLLOWUP = re.compile(r"(?:上次(?:说的)?|那个|那件事|后来|怎么样了|结果(?:如何|呢)|后续|呢|[？?。！!\s])+")
 _HISTORY_FILLER = re.compile(r"说过什么|聊过什么|聊了什么|发生了什么|那天|当时|什么|哪些|我们|what happened", re.I)
@@ -2217,6 +2221,7 @@ class RecallService:
             unique[_selection_key(row)] = row
         rows = list(unique.values())
         topics = [pattern for intent, pattern in _SEMANTIC_TOPICS if intent.search(current)]
+        personal_list = _PERSONAL_LIST_QUERY.search(current)
         scored = bm25_scores(query, rows, stop_names=stop_names, k1=settings.bm25_k1, b=settings.bm25_b)
         query_vector = await self._query_vector(query, deadline, self._tokens)
         cosine = _cosine_rank(query_vector, self._embedding_rows(pool)) if query_vector is not None else []
@@ -2255,6 +2260,9 @@ class RecallService:
             match = len(shared) >= 2 or bool(shared and (
                 query_terms <= shared or any(len(term) >= 3 or doc_frequency[term] == 1 for term in shared)
             ))
+            match |= bool(personal_list and row["_tier"] in ("fact", "fact_archive")
+                          and row.get("source") == "user_observation"
+                          and shared - _RECALL_FILLER_TERMS and _LIST_FACT.search(row["text"]))
             score = (lexical_score if match else 0.0) + vector.get(row["id"], 0.0)
             factor = fading_factor(row, now=now)
             if not (history or thread_hit) and factor < _surface_threshold("turn_context"):
@@ -2303,6 +2311,9 @@ class RecallService:
         reference = content_terms(" ".join(_turn_texts(recent)), self._stop_names) if has_anaphora(current) else set()
         anchor = anchor or {}
         topics = [pattern for intent, pattern in _SEMANTIC_TOPICS if intent.search(current)]
+        personal_list = _PERSONAL_LIST_QUERY.search(current)
+        location = _LOCATION_ACTION.search(current)
+        enumerated = []
         chosen = []
         for item in candidates:
             if item["kind"] == "original":
@@ -2319,8 +2330,18 @@ class RecallService:
             covered |= item["id"] == anchor.get("thread_id") or bool(
                 anchor.get("episode_id") and item["episode_id"] == anchor["episode_id"]
             )
+            if (personal_list and item["kind"] == "fact" and item.get("source") == "user_observation"
+                    and shared - _RECALL_FILLER_TERMS and _LIST_FACT.search(item["text"])):
+                enumerated.append(item)
             if covered or (item["kind"] == "fact" and any(pattern.search(item["text"]) for pattern in topics)):
                 chosen.append(dict(item, use="直接匹配当前问题"))
+        if location:
+            answers = [item for item in chosen if location[1] in item["text"]]
+            if answers:
+                chosen = answers
+        if not chosen and enumerated:
+            latest = max(enumerated, key=lambda item: item.get("occurred_at") or "")
+            chosen = [dict(latest, use="回忆此前列出的选择")]
         return self._fit_selection(chosen, token_budget)
 
     def _original_rows(self, character, subjects, scene, query, window, *, limit):

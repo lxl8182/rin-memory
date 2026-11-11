@@ -467,6 +467,8 @@ class MemoryApi:
             segment, topic_handoff = self.protocol.segment_history(scope, body.get("segment_history"))
         if service.settings.memory_enabled and not recent and scope["session_id"]:
             recent = self.protocol.recent_for_selection(scope)
+        if segment and not topic_handoff:
+            recent = selection_recent([*segment[-2:], *recent], text)
         recall = await service.core.recall.build_turn_context(
             service.settings.character, current_input=text,
             recent_turns=recent, subject=scope["subject"],

@@ -369,8 +369,9 @@ class ServiceCloseoutTests(unittest.TestCase):
         for subject, expected in (("qq-friend:42", [body["source_key"]]), ("qq-friend:43", []), ("private", [])):
             if subject == "qq-friend:43":
                 self.service.settings.clients["plugin"]["subjects"].append(subject)
-            carried = self.ok("/v1/context", dict(new, subject=subject, text="接着聊", segment_history=history), **plugin)
+            carried = self.ok("/v1/context", dict(new, subject=subject, text="那红茶呢", segment_history=history), **plugin)
             self.assertEqual(carried["context"].get("segment_sources", []), expected)
+            self.assertEqual(bool(carried["context"]["query_meta"]["used_turns"]), bool(expected))
         for index, (ids, sources) in enumerate((
             ([], []), ([fact_id, "unknown"], facts[0]["source_event_keys"]),
         )):

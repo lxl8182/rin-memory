@@ -153,8 +153,7 @@ class ServiceProtocol:
             if (not isinstance(user, str) or not user.strip() or not isinstance(reply, str) or not reply.strip()
                     or barrier.blocks_text(self.character, user) or barrier.blocks_text(self.character, reply)):
                 continue
-            allowed[key] = {"source_key": key, "user": user[:8000] if cold else "",
-                            "assistant": reply[:8000] if cold else ""}
+            allowed[key] = {"source_key": key, "user": user[:8000], "assistant": reply[:8000]}
         return list(allowed.values()), cold
 
     @staticmethod
