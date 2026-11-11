@@ -18,6 +18,7 @@ from pathlib import Path
 from rin_memory.adapters.composition import build_memory_core
 from rin_memory.contracts import DeletionRequest, Scope, Scene
 from rin_memory.domain.extraction import ExtractionSettings
+from rin_memory.domain.recall import RecallSettings
 
 
 class FixedClock:
@@ -323,6 +324,40 @@ class ExtractionFlowTests(unittest.IsolatedAsyncioTestCase):
                       text="对方偏爱白茶", operation="add")
         self.assertEqual(len(core.facts.load("demo")), 2)
         self.assertEqual(len(core.correction_service.active("demo")["items"]), 1)
+
+    async def test_aliases_find_written_and_corrected_facts_without_changing_evidence(self):
+        text = "我记得主人通关了《使命召唤：黑色行动 6》的战役。"
+        model = FakeModel([candidates({"text": text, "search_aliases": ["BO6", "bo6", "COD"]})])
+        core = build_memory_core(memory_root=self.root / "memory", clock=self.clock, model=model,
+                                 recall_settings=RecallSettings(fast_chat=True))
+        source = "host:demo:private:alias-one"
+        await core.extraction.ingest_turn(
+            "demo", [human("我通关了《使命召唤：黑色行动 6》的战役。")], source_key=source,
+        )
+        [fact] = core.facts.load("demo")
+        self.assertEqual(fact["search_aliases"], ["BO6", "COD"])
+        self.assertEqual(fact["text"], text)
+        self.assertEqual(fact["source_event_keys"], [source])
+
+        async def recall(question, *, subject="private"):
+            result = await core.recall.build_turn_context("demo", current_input=question, subject=subject)
+            return result["memory_ids"]
+
+        question = "我打完的那代 COD 战役叫什么？"
+        self.assertEqual(await recall(question), [fact["id"]])
+        self.assertEqual(await recall(question, subject="qq-friend:42"), [])
+        self.assertEqual(await recall("COD 是什么？"), [])
+        model.responses.append(candidates({"text": "我记得主人通关了《光环：致远星》。",
+                                            "search_aliases": ["Halo Reach"],
+                                            "operation": "correct", "target_id": fact["id"]}))
+        await core.extraction.ingest_turn(
+            "demo", [human("刚才说错了，通关的不是 COD，是《光环：致远星》。")],
+            source_key="host:demo:private:alias-correction",
+        )
+        _, replacement = core.facts.load("demo")
+        self.assertEqual(replacement["search_aliases"], ["Halo Reach"])
+        self.assertEqual(await recall(question), [])
+        self.assertEqual(await recall("我通关的 Halo Reach 叫什么？"), [replacement["id"]])
 
     async def test_failed_extraction_keeps_raw_text_and_retries(self):
         model = FakeModel([RuntimeError("provider down"), candidates(

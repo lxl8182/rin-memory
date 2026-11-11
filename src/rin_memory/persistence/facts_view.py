@@ -30,6 +30,7 @@ Invariants
 from __future__ import annotations
 
 import threading
+import unicodedata
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -43,6 +44,20 @@ ARCHIVE_FILE = "facts_archive.json"
 #: Envelope keys used by the versioned read branch (`schema.load_legacy_list`).
 _FACTS_KEY = "facts"
 _ARCHIVE_KEY = "archive"
+
+
+def fact_search_aliases(value: Any) -> list[str]:
+    """Bound optional retrieval names from extraction; old facts have none."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    names = {}
+    for item in value[:12]:
+        if not isinstance(item, str):
+            continue
+        name = " ".join(unicodedata.normalize("NFKC", item).split())
+        if 2 <= len(name) <= 64 and all(c.isalnum() or c in " -.:·'’()" for c in name):
+            names.setdefault(name.casefold(), name)
+    return list(names.values())[:4]
 
 
 class FactsView:

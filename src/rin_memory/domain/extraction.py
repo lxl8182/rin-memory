@@ -29,7 +29,7 @@ from ..contracts import CorrectionRequest, MemoryEvent, Scene, Scope
 from ..domain.barrier import DeletionBarrier, message_source_keys, message_text
 from ..event_sources import parse_source_key
 from ..invalidation import filter_valid_entries, is_friend_subject, row_matches_subject, scene_applies, subject_key
-from ..persistence.facts_view import FactsView
+from ..persistence.facts_view import FactsView, fact_search_aliases
 from ..persistence.gates import SuppressionGate
 from ..persistence.outbox import OutboxStore
 from ..persistence.recent import RecentStore
@@ -1168,13 +1168,14 @@ class ExtractionService:
                 if self._corrections is None or target_id in corrections:
                     return 0, [], "invalid_fact_target"
                 source = user_confirmation_bindings(candidate)[-1]["source_key"]
-                corrections[target_id] = CorrectionRequest(
+                request = CorrectionRequest(
                     scope=Scope(character, subject_key(candidate.get("subject")) or "private"),
                     target_fact_ids=(target_id,), source_key=source,
                     new_text=candidate["text"][:MAX_FACT_TEXT],
                     applies_to=Scene(**dict(_scope_fields(candidate))),
                     request_id="extract_" + _fact_hash(source + "|" + target_id + "|correct"),
                 )
+                corrections[target_id] = (request, candidate["search_aliases"])
         if any(row["operation"] == "confirm" and row["target_id"] in corrections for row in candidates):
             return 0, [], "conflicting_fact_operations"
         # Corrections already own invalidation and the new belief. They share
@@ -1188,8 +1189,8 @@ class ExtractionService:
             character, remaining, source_keys=(), window_keys=window_keys,
             context_refs=context_refs, episode_id=episode_id, occurred_at=occurred_at,
         )
-        for request in corrections.values():
-            self._corrections.correct_extracted(request)
+        for request, aliases in corrections.values():
+            self._corrections.correct_extracted(request, search_aliases=aliases)
         return written + len(corrections), persisted, ""
 
     def _persist_candidates(
@@ -1273,6 +1274,12 @@ class ExtractionService:
                 old_refs = set(existing.get("message_refs") or ())
                 new_users = [binding for binding in users if binding["source_key"] not in old_keys
                              and binding["message_ref"] not in old_refs]
+                if users and candidate.get("search_aliases"):
+                    aliases = fact_search_aliases(existing.get("search_aliases"))
+                    merged = fact_search_aliases([*aliases, *candidate["search_aliases"]])
+                    if merged != aliases:
+                        existing["search_aliases"] = merged
+                        changed = True
                 if users and existing.get("source") == "ai_disclosure" and source == "user_observation":
                     existing["source"] = "user_observation"
                     existing["signal_processed"] = False
@@ -1384,6 +1391,8 @@ class ExtractionService:
             "source_bindings": list(candidate.get("source_bindings") or ()),
         }
         _refresh_confirmation(row)
+        if candidate.get("search_aliases"):
+            row["search_aliases"] = candidate["search_aliases"]
         row["subject"] = str(candidate.get("subject") or "private")
         row["applies_to"] = dict(candidate.get("applies_to") or {})
         scope_suffix = hashlib.sha256((row["subject"] + row["entity"] + json.dumps(row["applies_to"], sort_keys=True)).encode()).hexdigest()[:8]
@@ -1890,6 +1899,7 @@ _FACT_ADMISSION = """
 我保留事实的适用场合、时间和语气。例如明确说“以前一直放在书桌上，现在放抽屉”时，记录当前位置和有用的变化。“这次想看某类内容”只描述这次的目标，只有用户已建立相关领域或计划时才写上该领域或计划。
 同一用途的一组选择在一条里写清。若对方说自己有甲、乙，两件都适合某个用途，这一条就能同时保留明确拥有和用途偏好；拥有关系有独立用途或需单独更新时才另存。后面明确增加第三项时，结合本批证据与已确认条目识别它是补充，同一批只记一次完整偏好。
 我以第一人称写 text，主体和说话者由字段及原话决定。旧事实和前文只供比较或理解指代，本批原话才是证据。
+每条事实都填写 search_aliases 数组。事实有明确的公共专名时，用我已知的通行简称、原名和译名补充最多四个名字，即使原话只用了其中一个名字。具体作品已明确时，常见的系列简称和作品简称各占一项。例：《怪物猎人：世界》可补 ["MH","MHW","Monster Hunter: World"]。每项写一个能独立使用的名字。没有明确专名或有歧义就写 []。这些名字只用于以后检索，text 仍只写原话支持的经历与细节。
 每条事实填写 text、importance（1-10）、entity（master/neko/relationship）、source（user_observation/user_correction/ai_disclosure/shared_experience）、
 sources（整数轮次编号）、message_refs（逐字复制 message_ref= 后的引用），以及 retention_reason（具体后续用途）和 retention_class。
 保留类别：durable 用于有明确依据的稳定身份、长期偏好或限制；shared_important 用于有明确重要结果、持续影响或纪念意义的经历；
@@ -1904,7 +1914,7 @@ correct 指向用户明确指出记错的旧 ID，text 只写正确的新认识�
 偏好一般省略 event_when。输出 JSON。每条 facts 对象必须显式填写 operation 和 target_id，操作示意如下：
 {"operation":"add","target_id":"","retention_class":"durable","retention_reason":"以后准备饮品时优先选择这个口味",
  "text":"我记得对方长期喜欢无糖豆浆。","entity":"master","source":"user_observation","importance":5,
- "sources":[1],"message_refs":["此处替换为本批真实消息引用"]}。
+ "search_aliases":[],"sources":[1],"message_refs":["此处替换为本批真实消息引用"]}。
 confirm 或 correct 同样填写 target_id 字段，值为相关旧事实中原样的 id。
 """
 
@@ -2041,6 +2051,7 @@ def _parse_extraction(
         candidate = dict(item)
         if not _valid_operation(candidate):
             return None
+        candidate["search_aliases"] = fact_search_aliases(candidate.get("search_aliases"))
         candidates.append(candidate)
     return candidates, [dict(item) for item in updates[:8]], [
         dict(item) for item in signals[:limit] if isinstance(item, Mapping)

@@ -48,6 +48,7 @@ from ..errors import (
 )
 from ..invalidation import row_matches_subject, scene_applies
 from ..ports import AtomicJsonStore, Clock, StorageRoots, WritePermit
+from .facts_view import fact_search_aliases
 from .version_cache import VersionReader
 
 CORRECTIONS_FILENAME = "memory_corrections.json"
@@ -685,6 +686,9 @@ class CorrectionStore:
                     "retracted_at": None,
                 }
                 revived = False
+            aliases = fact_search_aliases(spec.get("search_aliases"))
+            if aliases:
+                entry["search_aliases"] = aliases
             payload = {"entry": dict(entry), "superseded": superseded}
             return PreparedCorrection(
                 entry=dict(entry), payload=payload, revived=revived,

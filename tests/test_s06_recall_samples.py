@@ -122,6 +122,36 @@ class RecallSampleContractTests(unittest.IsolatedAsyncioTestCase):
                 result = await core.recall.build_turn_context("demo", current_input=question, subject="qq-friend:42")
                 self.assertEqual(result["memory_ids"], expected)
 
+    async def test_price_is_bound_to_the_purchased_item_within_a_fact(self):
+        core = build_memory_core(memory_root=self.root, clock=FixedClock(),
+                                 recall_settings=RecallSettings(fast_chat=True))
+        core.recover("demo")
+        core.facts.save("demo", [{"id": "purchase", "text": "青石 K8 键盘实付 299 元，键帽预算 80 元。",
+                                  "source": "user_observation", "schema_version": 2}])
+        for question, expected in (
+            ("青石 K8 的键帽我实付多少元？", []),
+            ("青石 K8 的键盘我实付多少元？", ["purchase"]),
+        ):
+            with self.subTest(question=question):
+                result = await core.recall.build_turn_context("demo", current_input=question)
+                self.assertEqual(result["memory_ids"], expected)
+
+    async def test_detail_followup_requires_an_unambiguous_recent_target(self):
+        core = build_memory_core(memory_root=self.root, clock=FixedClock(),
+                                 recall_settings=RecallSettings(fast_chat=True))
+        core.recover("demo")
+        core.facts.save("demo", [
+            {"id": "first", "text": "青石 K8 键盘是静音红轴。", "schema_version": 2},
+            {"id": "other", "text": "青石 K9 键盘是茶轴。", "schema_version": 2},
+        ])
+        for prior, expected in (("我现在用青石 K8。", ["first"]),
+                                ("我在比较青石 K8 和青石 K9。", [])):
+            with self.subTest(prior=prior):
+                result = await core.recall.build_turn_context(
+                    "demo", current_input="那把是什么轴来着？", recent_turns=[{"role": "user", "text": prior}],
+                )
+                self.assertEqual(result["memory_ids"], expected)
+
     def test_corpus_is_well_formed(self):
         cases = build_cases()
         self.assertGreaterEqual(len(cases), 8)

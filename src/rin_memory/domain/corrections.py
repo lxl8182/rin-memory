@@ -78,9 +78,9 @@ class CorrectionService:
         """Record a preference/fact correction and invalidate what it replaces."""
         return await asyncio.to_thread(self._correct_sync, request)
 
-    def correct_extracted(self, request: CorrectionRequest) -> CorrectionReceipt:
+    def correct_extracted(self, request: CorrectionRequest, *, search_aliases: Sequence[str] = ()) -> CorrectionReceipt:
         """Apply a source-bound extraction operation under the commit fence."""
-        return self._correct_sync(request, operation_id="corr_" + request.request_id)
+        return self._correct_sync(request, operation_id="corr_" + request.request_id, search_aliases=search_aliases)
 
     def extracted(self, character, source_keys, *, subject, repair=False):
         """Previously journaled extraction corrections from these utterances."""
@@ -153,12 +153,14 @@ class CorrectionService:
     # -- write flow ------------------------------------------------------
 
     def _correct_sync(
-        self, request: CorrectionRequest, *, operation_id: str = "",
+        self, request: CorrectionRequest, *, operation_id: str = "", search_aliases: Sequence[str] = (),
     ) -> CorrectionReceipt:
         character = request.scope.character
         spec = self._spec_from_request(request)
         if operation_id:
             spec["operation_id"] = operation_id
+        if search_aliases:
+            spec["search_aliases"] = search_aliases
         with self._barrier.write_lock(character):
             prepared = self._corrections.prepare(character, spec)
             if prepared.duplicate:
@@ -305,6 +307,8 @@ class CorrectionService:
             "absorbed": True,
             "signal_processed": True,
         }
+        if entry.get("search_aliases"):
+            row["search_aliases"] = list(entry["search_aliases"])
         if self._barrier.blocks_row(character, row):
             return None
         self._facts.save(character, active + [row])

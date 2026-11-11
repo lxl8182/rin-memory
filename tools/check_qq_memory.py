@@ -80,13 +80,16 @@ async def replay(args):
     if len(question_ids) != len(questions):
         raise ValueError("题单含有重复题号")
     facts = []
-    for key, who, day, text in table(document, "测试数据"):
+    for key, who, day, text, *metadata in table(document, "测试数据"):
         timestamp = day + "T03:00:00+00:00"
         subject = SUBJECTS[who]
-        facts.append({"id": key, "text": text, "subject": subject, "source": "user_observation",
-                      "importance": 6, "schema_version": 2, "created_at": timestamp, "event_start_at": timestamp,
-                      "source_event_keys": [f"plugin:qq:check:{subject.replace(':', '_')}:seed:{key}"],
-                      "episode_id": f"ep:qq-check:{key}", "retention_class": "normal"})
+        fact = {"id": key, "text": text, "subject": subject, "source": "user_observation",
+                "importance": 6, "schema_version": 2, "created_at": timestamp, "event_start_at": timestamp,
+                "source_event_keys": [f"plugin:qq:check:{subject.replace(':', '_')}:seed:{key}"],
+                "episode_id": f"ep:qq-check:{key}", "retention_class": "normal"}
+        if metadata and metadata[0]:
+            fact["search_aliases"] = [name.strip() for name in metadata[0].split("/")]
+        facts.append(fact)
     fact_subjects = {fact["id"]: fact["subject"] for fact in facts}
     if len(fact_subjects) != len(facts):
         raise ValueError("题单含有重复事实编号")
