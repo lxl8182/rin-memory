@@ -87,8 +87,8 @@ async def replay(args):
                       "importance": 6, "schema_version": 2, "created_at": timestamp, "event_start_at": timestamp,
                       "source_event_keys": [f"plugin:qq:check:{subject.replace(':', '_')}:seed:{key}"],
                       "episode_id": f"ep:qq-check:{key}", "retention_class": "normal"})
-    fact_ids = {fact["id"] for fact in facts}
-    if len(fact_ids) != len(facts):
+    fact_subjects = {fact["id"]: fact["subject"] for fact in facts}
+    if len(fact_subjects) != len(facts):
         raise ValueError("题单含有重复事实编号")
     with tempfile.TemporaryDirectory(prefix="rin-qq-check-") as directory:
         root = Path(directory)
@@ -103,25 +103,33 @@ async def replay(args):
             core.facts.save("check", facts)
             api = MemoryApi(service)
             cases, contexts = [], []
-            for key, who, question, expected, _, delete in questions:
+            deleted = set()
+            for key, who, question, expected, _, delete, *labels in questions:
                 if args.case and key not in args.case:
                     continue
+                category, prior = (labels + ["", ""])[:2]
                 needed = [] if expected == "空" else [group.split("/") for group in expected.split(",")]
-                if any(entry not in fact_ids for group in needed for entry in group):
+                if any(entry not in fact_subjects for group in needed for entry in group):
                     raise ValueError(f"{key} 引用了不存在的预期事实")
                 subject = SUBJECTS[who]
-                if delete:
-                    if delete not in fact_ids:
+                if delete and delete not in deleted:
+                    if delete not in fact_subjects:
                         raise ValueError(f"{key} 引用了不存在的待删事实 {delete}")
                     result = await core.deletion_service.forget(DeletionRequest(
-                        scope=Scope("check", subject), mode="entry", targets=(DeletionTarget(type="fact", id=delete),),
+                        scope=Scope("check", fact_subjects[delete]), mode="entry",
+                        targets=(DeletionTarget(type="fact", id=delete),),
                         reason="QQ fixture delete test"))
                     if result.status != "completed":
                         raise RuntimeError(f"{key} 的删除未完成 {result.status}")
-                context = await api.context({"subject": subject, "session_id": key, "scene": "plugin:qq",
-                                             "client_id": "check", "text": question})
+                    deleted.add(delete)
+                payload = {"subject": subject, "session_id": key, "scene": "plugin:qq",
+                           "client_id": "check", "text": question}
+                if prior:
+                    payload["recent_turns"] = [{"role": "user", "text": prior}]
+                context = await api.context(payload)
                 selection = context["context"]["selection"]
-                cases.append({"id": key, "question": question, "expected": needed, "status": selection["status"],
+                cases.append({"id": key, "category": category or "快速题", "question": question,
+                              "expected": needed, "status": selection["status"],
                               "selected": [item["id"] for item in selection["items"]]})
                 contexts.append({"context": context, "question": question})
             if not cases:
@@ -129,6 +137,16 @@ async def replay(args):
             return [score(case, ids) for case, ids in zip(cases, render(args.dsh_root, contexts), strict=True)]
         finally:
             await service.stop()
+
+
+def summarize(cases):
+    positive = [row for row in cases if row["expected"]]
+    empty = [row for row in cases if not row["expected"]]
+    return {"questions": len(cases), "injected": sum(len(row["injected"]) for row in cases),
+            "extra": sum(len(row["extra"]) for row in cases),
+            "questions_with_extra": sum(bool(row["extra"]) for row in cases),
+            "empty_questions": len(empty), "empty_with_injection": sum(bool(row["injected"]) for row in empty),
+            "positive_questions": len(positive), "positive_complete": sum(not row["missing"] for row in positive)}
 
 
 def main():
@@ -141,21 +159,20 @@ def main():
     parser.add_argument("--allow-missing", action="append", help="检查时允许指定题号漏召回，可重复传入")
     args = parser.parse_args()
     cases = asyncio.run(replay(args))
-    positive = [row for row in cases if row["expected"]]
-    empty = [row for row in cases if not row["expected"]]
-    summary = {"questions": len(cases), "injected": sum(len(row["injected"]) for row in cases),
-               "extra": sum(len(row["extra"]) for row in cases),
-               "questions_with_extra": sum(bool(row["extra"]) for row in cases),
-               "empty_questions": len(empty), "empty_with_injection": sum(bool(row["injected"]) for row in empty),
-               "positive_questions": len(positive), "positive_complete": sum(not row["missing"] for row in positive)}
+    summary = summarize(cases)
+    groups = {}
+    for row in cases:
+        groups.setdefault(row["category"], []).append(row)
+    by_category = {name: summarize(rows) for name, rows in groups.items()}
     if args.json:
-        print(json.dumps({"summary": summary, "cases": cases}, ensure_ascii=False, indent=2))
+        print(json.dumps({"summary": summary, "by_category": by_category, "cases": cases}, ensure_ascii=False, indent=2))
     else:
         for row in cases:
             print(f"{row['id']}  带入 {row['injected']}  无用 {row['extra']}  漏掉 {row['missing']}")
-        print(f"无用事实 {summary['extra']}/{summary['injected']}，"
-              f"应空误注入 {summary['empty_with_injection']}/{len(empty)}，"
-              f"正例完整命中 {summary['positive_complete']}/{len(positive)}")
+        for name, stats in ([*by_category.items(), ("总计", summary)] if len(groups) > 1 else [("总计", summary)]):
+            print(f"{name}  无用事实 {stats['extra']}/{stats['injected']}，"
+                  f"应空误注入 {stats['empty_with_injection']}/{stats['empty_questions']}，"
+                  f"正例完整命中 {stats['positive_complete']}/{stats['positive_questions']}")
     allowed = set(args.allow_missing or ())
     failed = any(row["extra"] or (row["missing"] and row["id"] not in allowed)
                  or row["status"] not in {"selected", "empty"} for row in cases)
